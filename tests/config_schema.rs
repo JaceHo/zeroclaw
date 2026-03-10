@@ -85,8 +85,8 @@ fn gateway_config_defaults_are_secure() {
 #[test]
 fn gateway_config_rate_limit_defaults() {
     let gw = GatewayConfig::default();
-    assert_eq!(gw.pair_rate_limit_per_minute, 10);
-    assert_eq!(gw.webhook_rate_limit_per_minute, 60);
+    assert_eq!(gw.pair_rate_limit_per_minute, 30);
+    assert_eq!(gw.webhook_rate_limit_per_minute, 300);
     assert_eq!(gw.rate_limit_max_keys, 10_000);
 }
 
@@ -140,7 +140,7 @@ port = 9090
     assert_eq!(parsed.gateway.port, 9090);
     assert_eq!(parsed.gateway.host, "127.0.0.1");
     assert!(parsed.gateway.require_pairing);
-    assert_eq!(parsed.gateway.pair_rate_limit_per_minute, 10);
+    assert_eq!(parsed.gateway.pair_rate_limit_per_minute, 30);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

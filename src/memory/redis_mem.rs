@@ -115,13 +115,17 @@ impl Memory for RedisMemory {
         let now = Local::now().to_rfc3339();
         let cat = Self::category_to_str(&category).to_string();
 
+        let keys_key = self.keys_key();
+        let vs_key = self.vs_key();
+        let data_key = self.data_key();
+
         // Check if key already exists (upsert semantics)
-        let existing_id: Option<String> = conn.hget(&self.keys_key(), key).await.unwrap_or(None);
+        let existing_id: Option<String> = conn.hget(&keys_key, key).await.unwrap_or(None);
 
         let id = if let Some(ref eid) = existing_id {
             // Remove old vector entry before re-adding
             let _: Result<(), redis::RedisError> = redis::cmd("VREM")
-                .arg(&self.vs_key())
+                .arg(&vs_key)
                 .arg(eid.as_str())
                 .query_async(&mut conn)
                 .await;
@@ -146,13 +150,13 @@ impl Memory for RedisMemory {
             "timestamp": now,
         });
         let _: () = conn
-            .hset(&self.data_key(), &id, entry_json.to_string())
+            .hset(&data_key, &id, entry_json.to_string())
             .await
             .context("Redis HSET data failed")?;
 
         // Store key→ID mapping
         let _: () = conn
-            .hset(&self.keys_key(), key, &id)
+            .hset(&keys_key, key, &id)
             .await
             .context("Redis HSET keys failed")?;
 
@@ -167,7 +171,7 @@ impl Memory for RedisMemory {
             });
 
             let result: Result<(), redis::RedisError> = redis::cmd("VADD")
-                .arg(&self.vs_key())
+                .arg(&vs_key)
                 .arg("FP32")
                 .arg(bytes.as_slice())
                 .arg(&id)
@@ -209,10 +213,12 @@ impl Memory for RedisMemory {
         };
 
         let bytes = vector::vec_to_bytes(&emb);
+        let vs_key = self.vs_key();
+        let data_key = self.data_key();
 
         // Build VSIM command with optional session filter
         let mut cmd = redis::cmd("VSIM");
-        cmd.arg(&self.vs_key())
+        cmd.arg(&vs_key)
             .arg("FP32")
             .arg(bytes.as_slice())
             .arg("COUNT")
@@ -232,13 +238,14 @@ impl Memory for RedisMemory {
         let mut i = 0;
         while i + 1 < raw.len() {
             let id = match &raw[i] {
-                redis::Value::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                redis::Value::BulkString(id_bytes) => String::from_utf8_lossy(id_bytes).to_string(),
                 redis::Value::SimpleString(s) => s.clone(),
                 _ => {
                     i += 2;
                     continue;
                 }
             };
+            #[allow(clippy::cast_precision_loss)]
             let score = match &raw[i + 1] {
                 redis::Value::BulkString(s) => {
                     String::from_utf8_lossy(s).parse::<f64>().unwrap_or(0.0)
@@ -254,7 +261,7 @@ impl Memory for RedisMemory {
         // Fetch full entries for the result IDs
         let mut entries = Vec::with_capacity(result_ids.len());
         for (id, score) in &result_ids {
-            let json: Option<String> = conn.hget(&self.data_key(), id).await.unwrap_or(None);
+            let json: Option<String> = conn.hget(&data_key, id).await.unwrap_or(None);
             if let Some(json) = json {
                 if let Ok(mut entry) = Self::parse_entry(id, &json) {
                     entry.score = Some(*score);
@@ -268,15 +275,17 @@ impl Memory for RedisMemory {
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         let mut conn = self.conn.clone();
+        let keys_key = self.keys_key();
+        let data_key = self.data_key();
 
         // Lookup ID by key
-        let id: Option<String> = conn.hget(&self.keys_key(), key).await.unwrap_or(None);
+        let id: Option<String> = conn.hget(&keys_key, key).await.unwrap_or(None);
         let Some(id) = id else {
             return Ok(None);
         };
 
         // Fetch full entry
-        let json: Option<String> = conn.hget(&self.data_key(), &id).await.unwrap_or(None);
+        let json: Option<String> = conn.hget(&data_key, &id).await.unwrap_or(None);
         match json {
             Some(json) => Ok(Some(Self::parse_entry(&id, &json)?)),
             None => Ok(None),
@@ -289,10 +298,11 @@ impl Memory for RedisMemory {
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let mut conn = self.conn.clone();
+        let data_key = self.data_key();
 
         // Get all entries from data hash
         let all: std::collections::HashMap<String, String> =
-            conn.hgetall(&self.data_key()).await.unwrap_or_default();
+            conn.hgetall(&data_key).await.unwrap_or_default();
 
         let mut entries = Vec::new();
         for (id, json) in &all {
@@ -319,32 +329,36 @@ impl Memory for RedisMemory {
 
     async fn forget(&self, key: &str) -> Result<bool> {
         let mut conn = self.conn.clone();
+        let keys_key = self.keys_key();
+        let vs_key = self.vs_key();
+        let data_key = self.data_key();
 
         // Lookup ID by key
-        let id: Option<String> = conn.hget(&self.keys_key(), key).await.unwrap_or(None);
+        let id: Option<String> = conn.hget(&keys_key, key).await.unwrap_or(None);
         let Some(id) = id else {
             return Ok(false);
         };
 
         // Remove from vectorset
         let _: Result<(), redis::RedisError> = redis::cmd("VREM")
-            .arg(&self.vs_key())
+            .arg(&vs_key)
             .arg(&id)
             .query_async(&mut conn)
             .await;
 
         // Remove from data hash
-        let _: () = conn.hdel(&self.data_key(), &id).await.unwrap_or(());
+        let _: () = conn.hdel(&data_key, &id).await.unwrap_or(());
 
         // Remove key→ID mapping
-        let _: () = conn.hdel(&self.keys_key(), key).await.unwrap_or(());
+        let _: () = conn.hdel(&keys_key, key).await.unwrap_or(());
 
         Ok(true)
     }
 
     async fn count(&self) -> Result<usize> {
         let mut conn = self.conn.clone();
-        let count: usize = conn.hlen(&self.data_key()).await.unwrap_or(0);
+        let data_key = self.data_key();
+        let count: usize = conn.hlen(&data_key).await.unwrap_or(0);
         Ok(count)
     }
 

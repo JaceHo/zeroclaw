@@ -391,8 +391,10 @@ pub fn create_memory_for_migration(
 /// `[memory]` config sections). Delegates to `create_memory_with_storage_and_routes`
 /// for non-Redis backends.
 pub fn create_memory_from_config(config: &crate::Config) -> anyhow::Result<Box<dyn Memory>> {
-    let backend_name =
-        effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    let backend_name = effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
 
     #[cfg(feature = "redis")]
     if classify_memory_backend(&backend_name) == MemoryBackendKind::Redis {
@@ -418,9 +420,7 @@ pub fn create_memory_from_config(config: &crate::Config) -> anyhow::Result<Box<d
 #[cfg(feature = "redis")]
 fn create_redis_memory(config: &crate::Config) -> anyhow::Result<Box<dyn Memory>> {
     if !config.redis.enabled {
-        anyhow::bail!(
-            "memory backend 'redis' requires [redis].enabled = true in config"
-        );
+        anyhow::bail!("memory backend 'redis' requires [redis].enabled = true in config");
     }
 
     let resolved_embedding = resolve_embedding_config(

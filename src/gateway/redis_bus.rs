@@ -27,6 +27,7 @@ impl RedisEventBus {
     ///
     /// `redis_url` is used to open a dedicated pub/sub connection (separate from
     /// the `ConnectionManager` used for publishing).
+    #[allow(clippy::unused_async)]
     pub async fn new(
         conn: redis::aio::ConnectionManager,
         redis_url: &str,

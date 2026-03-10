@@ -124,7 +124,7 @@ impl ResponseCacheBackend for RedisResponseCache {
             let hits: i64 = conn.get(&hits_key).await.unwrap_or(0);
             let tokens_saved: i64 = conn.get(&tokens_key).await.unwrap_or(0);
 
-            #[allow(clippy::cast_sign_loss)]
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok((
                 entries.max(0) as usize,
                 hits.max(0) as u64,

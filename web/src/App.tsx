@@ -12,6 +12,7 @@ import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import { AuthProvider, useAuth } from './hooks/useAuth';
+import { ChatProvider } from './hooks/useChat';
 import { setLocale, type Locale } from './lib/i18n';
 
 // Locale context
@@ -111,21 +112,23 @@ function AppContent() {
 
   return (
     <LocaleContext.Provider value={{ locale, setAppLocale }}>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/agent" element={<AgentChat />} />
-          <Route path="/tools" element={<Tools />} />
-          <Route path="/cron" element={<Cron />} />
-          <Route path="/integrations" element={<Integrations />} />
-          <Route path="/memory" element={<Memory />} />
-          <Route path="/config" element={<Config />} />
-          <Route path="/cost" element={<Cost />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/doctor" element={<Doctor />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
+      <ChatProvider>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/agent" element={<AgentChat />} />
+            <Route path="/tools" element={<Tools />} />
+            <Route path="/cron" element={<Cron />} />
+            <Route path="/integrations" element={<Integrations />} />
+            <Route path="/memory" element={<Memory />} />
+            <Route path="/config" element={<Config />} />
+            <Route path="/cost" element={<Cost />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/doctor" element={<Doctor />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+      </ChatProvider>
     </LocaleContext.Provider>
   );
 }

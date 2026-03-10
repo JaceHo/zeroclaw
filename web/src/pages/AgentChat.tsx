@@ -1,143 +1,29 @@
 import { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
-import type { WsMessage } from '@/types/api';
-import { WebSocketClient } from '@/lib/ws';
-
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'agent';
-  content: string;
-  timestamp: Date;
-}
+import { useChat } from '@/hooks/useChat';
 
 export default function AgentChat() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
-  const [typing, setTyping] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    messages,
+    streamingContent,
+    typing,
+    connected,
+    error,
+    sendMessage,
+  } = useChat();
 
-  const wsRef = useRef<WebSocketClient | null>(null);
+  const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const pendingContentRef = useRef('');
-
-  useEffect(() => {
-    const ws = new WebSocketClient();
-
-    ws.onOpen = () => {
-      setConnected(true);
-      setError(null);
-    };
-
-    ws.onClose = () => {
-      setConnected(false);
-    };
-
-    ws.onError = () => {
-      setError('Connection error. Attempting to reconnect...');
-    };
-
-    ws.onMessage = (msg: WsMessage) => {
-      switch (msg.type) {
-        case 'chunk':
-          setTyping(true);
-          pendingContentRef.current += msg.content ?? '';
-          break;
-
-        case 'message':
-        case 'done': {
-          const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-          if (content) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: crypto.randomUUID(),
-                role: 'agent',
-                content,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-          pendingContentRef.current = '';
-          setTyping(false);
-          break;
-        }
-
-        case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: 'agent',
-              content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
-
-        case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: 'agent',
-              content: `[Tool Result] ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
-
-        case 'error':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: 'agent',
-              content: `[Error] ${msg.message ?? 'Unknown error'}`,
-              timestamp: new Date(),
-            },
-          ]);
-          setTyping(false);
-          pendingContentRef.current = '';
-          break;
-      }
-    };
-
-    ws.connect();
-    wsRef.current = ws;
-
-    return () => {
-      ws.disconnect();
-    };
-  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing]);
+  }, [messages, streamingContent, typing]);
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || !wsRef.current?.connected) return;
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: crypto.randomUUID(),
-        role: 'user',
-        content: trimmed,
-        timestamp: new Date(),
-      },
-    ]);
-
-    try {
-      wsRef.current.sendMessage(trimmed);
-      setTyping(true);
-      pendingContentRef.current = '';
-    } catch {
-      setError('Failed to send message. Please try again.');
-    }
-
+    if (!trimmed || !connected) return;
+    sendMessage(trimmed);
     setInput('');
     inputRef.current?.focus();
   };
@@ -161,7 +47,7 @@ export default function AgentChat() {
 
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.length === 0 && (
+        {messages.length === 0 && !typing && (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <Bot className="h-12 w-12 mb-3 text-gray-600" />
             <p className="text-lg font-medium">ZeroClaw Agent</p>
@@ -208,17 +94,25 @@ export default function AgentChat() {
           </div>
         ))}
 
+        {/* Real-time streaming bubble — shows chunks as they arrive */}
         {typing && (
           <div className="flex items-start gap-3">
             <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center">
               <Bot className="h-4 w-4 text-white" />
             </div>
-            <div className="bg-gray-800 border border-gray-700 rounded-xl px-4 py-3">
-              <div className="flex items-center gap-1">
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-              </div>
+            <div className="max-w-[75%] bg-gray-800 border border-gray-700 rounded-xl px-4 py-3">
+              {streamingContent ? (
+                <p className="text-sm text-gray-100 whitespace-pre-wrap break-words">
+                  {streamingContent}
+                  <span className="inline-block w-2 h-4 ml-0.5 bg-gray-400 animate-pulse align-text-bottom" />
+                </p>
+              ) : (
+                <div className="flex items-center gap-1">
+                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                </div>
+              )}
               <p className="text-xs text-gray-500 mt-1">Typing...</p>
             </div>
           </div>

@@ -2729,6 +2729,13 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
             }
         } else {
+            if native_tool_calls.len() != individual_results.len() {
+                tracing::warn!(
+                    native = native_tool_calls.len(),
+                    results = individual_results.len(),
+                    "native_tool_calls / individual_results length mismatch — truncating to shorter"
+                );
+            }
             for (native_call, (_, result)) in
                 native_tool_calls.iter().zip(individual_results.iter())
             {
@@ -3488,6 +3495,12 @@ impl AgentSessionContext {
         })
     }
 
+    /// Replace the session observer (e.g. to inject a BroadcastObserver that
+    /// forwards events to the SSE dashboard).
+    pub fn set_observer(&mut self, observer: Arc<dyn Observer>) {
+        self.observer = observer;
+    }
+
     /// Return initial history with the system prompt.
     pub fn initial_history(&self) -> Vec<ChatMessage> {
         vec![ChatMessage::system(&self.system_prompt)]
@@ -3523,7 +3536,8 @@ impl AgentSessionContext {
         history: &mut Vec<ChatMessage>,
         message: &str,
     ) -> Result<String> {
-        self.process_turn_streaming(history, message, None).await
+        self.process_turn_streaming(history, message, None, None)
+            .await
     }
 
     /// Like [`process_turn`](Self::process_turn), but accepts an optional
@@ -3534,6 +3548,7 @@ impl AgentSessionContext {
         history: &mut Vec<ChatMessage>,
         message: &str,
         on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+        cancellation_token: Option<CancellationToken>,
     ) -> Result<String> {
         // Inject memory + hardware RAG context into user message
         let mem_context = build_context(self.mem.as_ref(), message, self.min_relevance_score).await;
@@ -3566,7 +3581,7 @@ impl AgentSessionContext {
             &self.channel_name,
             &self.multimodal_config,
             self.max_tool_iterations,
-            None,
+            cancellation_token,
             on_delta,
             self.hooks.as_deref(),
             if self.channel_name == "cli" {

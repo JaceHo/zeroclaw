@@ -23,7 +23,15 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+/// Server-side ping interval for keepalive / half-open detection.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// If no Pong is received within this duration after a Ping, the connection
+/// is considered dead and will be closed.
+const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -90,10 +98,59 @@ async fn handle_socket_inner(
     let (ws_sender, mut receiver) = socket.split();
     let ws_sender = Arc::new(Mutex::new(ws_sender));
 
+    // --- CN-005: Server-side ping interval ---
+    // Track the last time we received a Pong so we can detect stale connections.
+    let last_pong = Arc::new(Mutex::new(std::time::Instant::now()));
+
+    // Connection-level cancellation token: cancelled when the client disconnects
+    // or the ping/pong watchdog fires.
+    let conn_token = CancellationToken::new();
+
+    // Spawn a task that sends Ping frames at a fixed interval and closes the
+    // connection if no Pong arrives within PONG_TIMEOUT.
+    let ping_sender = Arc::clone(&ws_sender);
+    let ping_pong_tracker = Arc::clone(&last_pong);
+    let ping_conn_token = conn_token.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PING_INTERVAL);
+        // The first tick completes immediately; skip it so the first real ping
+        // fires after PING_INTERVAL.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = ping_conn_token.cancelled() => break,
+            }
+
+            // Send a Ping frame.
+            let send_ok = ping_sender
+                .lock()
+                .await
+                .send(Message::Ping(vec![].into()))
+                .await
+                .is_ok();
+            if !send_ok {
+                ping_conn_token.cancel();
+                break;
+            }
+
+            // Check if last Pong is within the timeout window.
+            let elapsed = ping_pong_tracker.lock().await.elapsed();
+            if elapsed > PONG_TIMEOUT {
+                tracing::warn!("WS client pong timeout ({elapsed:?}), closing connection");
+                // Best-effort close frame before cancelling.
+                let _ = ping_sender.lock().await.send(Message::Close(None)).await;
+                ping_conn_token.cancel();
+                break;
+            }
+        }
+    });
+
     // Build session context once on connect — provider, tools, memory, etc.
     // are reused across all turns in this WebSocket connection.
     let config = state.config.lock().clone();
-    let ctx = match crate::agent::AgentSessionContext::from_config(&config).await {
+    let mut ctx = match crate::agent::AgentSessionContext::from_config(&config).await {
         Ok(ctx) => ctx,
         Err(e) => {
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
@@ -106,17 +163,48 @@ async fn handle_socket_inner(
                 .await
                 .send(Message::Text(err.to_string().into()))
                 .await;
+            conn_token.cancel();
+            ping_task.abort();
             return;
         }
     };
 
+    // --- CN-002: inject the gateway's broadcast observer so inner events
+    // (tool-call, LLM-request, etc.) are forwarded to the SSE dashboard.
+    ctx.set_observer(state.observer.clone());
+
     // Persistent conversation history for the lifetime of this connection.
     let mut history = ctx.initial_history();
 
-    while let Some(msg) = receiver.next().await {
+    // --- CN-006: per-connection sliding-window rate limiter ---
+    let rate_limit = state.ws_rate_limit_per_minute;
+    let mut rate_window_start = std::time::Instant::now();
+    let mut rate_window_count: u32 = 0;
+
+    loop {
+        let msg = tokio::select! {
+            biased;
+            () = conn_token.cancelled() => break,
+            next = receiver.next() => next,
+        };
+
         let msg = match msg {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) | Err(_) => break,
+            Some(Ok(Message::Text(text))) => text,
+            // --- CN-005: handle Ping/Pong frames ---
+            Some(Ok(Message::Ping(data))) => {
+                let _ = ws_sender.lock().await.send(Message::Pong(data)).await;
+                continue;
+            }
+            Some(Ok(Message::Pong(_))) => {
+                // Update last-pong timestamp for the keepalive watchdog.
+                *last_pong.lock().await = std::time::Instant::now();
+                continue;
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                // Client disconnected — cancel any in-flight turn.
+                conn_token.cancel();
+                break;
+            }
             _ => continue,
         };
 
@@ -142,6 +230,32 @@ async fn handle_socket_inner(
         let content = parsed["content"].as_str().unwrap_or("").to_string();
         if content.is_empty() {
             continue;
+        }
+
+        // --- CN-006: enforce per-connection rate limit ---
+        if rate_limit > 0 {
+            let now = std::time::Instant::now();
+            if now.duration_since(rate_window_start) >= Duration::from_secs(60) {
+                // Window expired — reset.
+                rate_window_start = now;
+                rate_window_count = 0;
+            }
+            rate_window_count += 1;
+            if rate_window_count > rate_limit {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!(
+                        "Rate limit exceeded: max {} messages per minute. Please wait.",
+                        rate_limit
+                    ),
+                });
+                let _ = ws_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(err.to_string().into()))
+                    .await;
+                continue;
+            }
         }
 
         let provider_label = &ctx.provider_name;
@@ -186,9 +300,19 @@ async fn handle_socket_inner(
             }
         });
 
+        // --- CN-001: create a per-turn cancellation token as a child of conn_token ---
+        // When conn_token is cancelled (client disconnect / pong timeout), the
+        // child token is automatically cancelled, stopping the agent turn.
+        let this_turn_token = conn_token.child_token();
+
         // Multi-turn agent loop with streaming: history persists across messages.
         match ctx
-            .process_turn_streaming(&mut history, &content, Some(delta_tx))
+            .process_turn_streaming(
+                &mut history,
+                &content,
+                Some(delta_tx),
+                Some(this_turn_token),
+            )
             .await
         {
             Ok(response) => {
@@ -239,6 +363,10 @@ async fn handle_socket_inner(
             }
         }
     }
+
+    // Clean up: cancel the ping task (idempotent if already done).
+    conn_token.cancel();
+    ping_task.abort();
 }
 
 /// RAII guard that decrements the WS connection counter when dropped.

@@ -226,16 +226,17 @@ impl crate::observability::Observer for BroadcastObserver {
                 "type": "turn_complete",
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
-            crate::observability::ObserverEvent::ChannelMessage {
-                channel,
-                direction,
-            } => serde_json::json!({
-                "type": "channel_message",
-                "channel": channel,
-                "direction": direction,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            _ => return, // Skip HeartbeatTick and other internal events
+            crate::observability::ObserverEvent::ChannelMessage { channel, direction } => {
+                serde_json::json!({
+                    "type": "channel_message",
+                    "channel": channel,
+                    "direction": direction,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            // Explicitly skip internal-only events so adding a new ObserverEvent
+            // variant triggers a compile error here instead of being silently dropped.
+            crate::observability::ObserverEvent::HeartbeatTick => return,
         };
 
         self.tx.publish(json);

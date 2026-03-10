@@ -103,10 +103,15 @@ impl SqliteMemory {
         let conn = if let Some(secs) = open_timeout_secs {
             let capped = secs.min(SQLITE_OPEN_TIMEOUT_CAP_SECS);
             let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let result = Connection::open(&path_buf);
-                let _ = tx.send(result);
-            });
+            thread::Builder::new()
+                .name("sqlite-open".into())
+                .spawn(move || {
+                    let result = Connection::open(&path_buf);
+                    // If the receiver has been dropped (timeout), the connection
+                    // is dropped here, releasing file handles.
+                    let _ = tx.send(result);
+                })
+                .context("failed to spawn SQLite open thread")?;
             match rx.recv_timeout(Duration::from_secs(capped)) {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => return Err(e).context("SQLite failed to open database"),

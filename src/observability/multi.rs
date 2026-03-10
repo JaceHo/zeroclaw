@@ -54,7 +54,9 @@ impl Observer for MultiObserver {
     }
 
     fn as_any(&self) -> &dyn Any {
-        self
+        // Delegate to the first observer so downcasts (e.g. to PrometheusObserver)
+        // work through the MultiObserver wrapper. Falls back to self if empty.
+        self.observers.first().map(|o| o.as_any()).unwrap_or(self)
     }
 }
 

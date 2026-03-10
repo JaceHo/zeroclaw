@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::sync::Mutex;
 
 /// Markdown-based memory — plain files as source of truth
 ///
@@ -11,12 +12,15 @@ use tokio::fs;
 ///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
 pub struct MarkdownMemory {
     workspace_dir: PathBuf,
+    /// Serializes file writes to prevent TOCTOU races in append_to_file.
+    write_lock: Mutex<()>,
 }
 
 impl MarkdownMemory {
     pub fn new(workspace_dir: &Path) -> Self {
         Self {
             workspace_dir: workspace_dir.to_path_buf(),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -40,6 +44,9 @@ impl MarkdownMemory {
 
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
+
+        // Hold write lock for the entire read-modify-write to prevent TOCTOU races.
+        let _guard = self.write_lock.lock().await;
 
         let existing = if path.exists() {
             fs::read_to_string(path).await.unwrap_or_default()

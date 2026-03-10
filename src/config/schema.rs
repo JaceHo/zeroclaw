@@ -806,6 +806,10 @@ pub struct GatewayConfig {
     /// Capacity of the SSE event broadcast channel. Default: `1024`.
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
+
+    /// Max messages per minute per WebSocket connection (0 = unlimited). Default: `10`.
+    #[serde(default = "default_ws_rate_limit_per_minute")]
+    pub ws_rate_limit_per_minute: u32,
 }
 
 fn default_gateway_port() -> u16 {
@@ -848,6 +852,10 @@ fn default_event_bus_capacity() -> usize {
     1024
 }
 
+fn default_ws_rate_limit_per_minute() -> u32 {
+    10
+}
+
 fn default_true() -> bool {
     true
 }
@@ -869,6 +877,7 @@ impl Default for GatewayConfig {
             max_ws_connections: default_max_ws_connections(),
             max_sse_connections: default_max_sse_connections(),
             event_bus_capacity: default_event_bus_capacity(),
+            ws_rate_limit_per_minute: default_ws_rate_limit_per_minute(),
         }
     }
 }
@@ -4512,24 +4521,12 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
-        // Tunnel: validate custom start_command to prevent obvious command injection
+        // Tunnel: validate custom start_command to prevent command injection.
+        // Delegates to the shared validation in tunnel::custom which checks
+        // for shell metacharacters AND enforces a binary allowlist.
         if self.tunnel.provider == "custom" {
             if let Some(ref custom) = self.tunnel.custom {
-                let cmd = custom.start_command.trim();
-                if cmd.is_empty() {
-                    anyhow::bail!("tunnel.custom.start_command must not be empty");
-                }
-                // Block shell metacharacters that could enable injection via
-                // config.toml manipulation (the command is split by whitespace
-                // and passed to Command::new, not a shell, but these chars are
-                // still suspicious and indicate misconfiguration).
-                const DANGEROUS_CHARS: &[char] = &['|', ';', '&', '$', '`', '(', ')', '<', '>'];
-                if cmd.contains(DANGEROUS_CHARS) {
-                    anyhow::bail!(
-                        "tunnel.custom.start_command contains shell metacharacters (|;&$`()<>); \
-                         use a wrapper script if complex shell logic is needed"
-                    );
-                }
+                crate::tunnel::custom::validate_start_command(&custom.start_command)?;
             } else {
                 anyhow::bail!(
                     "tunnel.provider = \"custom\" but [tunnel.custom] section is missing"
@@ -6212,6 +6209,7 @@ channel_id = "C123"
             max_ws_connections: 64,
             max_sse_connections: 128,
             event_bus_capacity: 1024,
+            ws_rate_limit_per_minute: 15,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6224,6 +6222,7 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.ws_rate_limit_per_minute, 15);
     }
 
     #[test]

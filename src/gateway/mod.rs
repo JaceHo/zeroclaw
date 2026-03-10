@@ -323,6 +323,8 @@ pub struct AppState {
     pub sse_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// Maximum concurrent SSE connections (0 = unlimited).
     pub max_sse_connections: usize,
+    /// Max messages per minute per WebSocket connection (0 = unlimited).
+    pub ws_rate_limit_per_minute: u32,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -702,6 +704,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         max_ws_connections: config.gateway.max_ws_connections,
         sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_sse_connections: config.gateway.max_sse_connections,
+        ws_rate_limit_per_minute: config.gateway.ws_rate_limit_per_minute,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1230,46 +1233,48 @@ async fn handle_whatsapp_message(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
+    // --- CN-009: acknowledge immediately, process LLM in background ---
+    let wa = Arc::clone(wa);
+    let state_bg = state.clone();
 
-        // Auto-save to memory
-        if state.auto_save {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+    tokio::spawn(async move {
+        for msg in &messages {
+            tracing::info!(
+                "WhatsApp message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state_bg.auto_save {
+                let key = whatsapp_memory_key(msg);
+                let _ = state_bg
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
-        }
-    }
 
-    // Acknowledge the webhook
+            match run_gateway_chat_with_tools(&state_bg, &msg.content).await {
+                Ok(response) => {
+                    if let Err(e) = wa
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send WhatsApp reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    let _ = wa
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
+        }
+    });
+
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1337,47 +1342,48 @@ async fn handle_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
+    // --- CN-009: acknowledge immediately, process LLM in background ---
+    let linq = Arc::clone(linq);
+    let state_bg = state.clone();
 
-        // Auto-save to memory
-        if state.auto_save {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+    tokio::spawn(async move {
+        for msg in &messages {
+            tracing::info!(
+                "Linq message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
 
-        // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via Linq
-                if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Linq reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state_bg.auto_save {
+                let key = linq_memory_key(msg);
+                let _ = state_bg
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
-        }
-    }
 
-    // Acknowledge the webhook
+            match run_gateway_chat_with_tools(&state_bg, &msg.content).await {
+                Ok(response) => {
+                    if let Err(e) = linq
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Linq reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    let _ = linq
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
+        }
+    });
+
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1472,47 +1478,48 @@ async fn handle_wati_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "WATI message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
+    // --- CN-009: acknowledge immediately, process LLM in background ---
+    let wati = Arc::clone(wati);
+    let state_bg = state.clone();
 
-        // Auto-save to memory
-        if state.auto_save {
-            let key = wati_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+    tokio::spawn(async move {
+        for msg in &messages {
+            tracing::info!(
+                "WATI message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
 
-        // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via WATI
-                if let Err(e) = wati
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WATI reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state_bg.auto_save {
+                let key = wati_memory_key(msg);
+                let _ = state_bg
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
-        }
-    }
 
-    // Acknowledge the webhook
+            match run_gateway_chat_with_tools(&state_bg, &msg.content).await {
+                Ok(response) => {
+                    if let Err(e) = wati
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send WATI reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for WATI message: {e:#}");
+                    let _ = wati
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
+        }
+    });
+
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1579,41 +1586,47 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
+    // --- CN-009: acknowledge immediately, process LLM in background ---
+    let nextcloud_talk = Arc::clone(nextcloud_talk);
+    let state_bg = state.clone();
 
-        if state.auto_save {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+    tokio::spawn(async move {
+        for msg in &messages {
+            tracing::info!(
+                "Nextcloud Talk message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state_bg.auto_save {
+                let key = nextcloud_talk_memory_key(msg);
+                let _ = state_bg
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
+
+            match run_gateway_chat_with_tools(&state_bg, &msg.content).await {
+                Ok(response) => {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                    let _ = nextcloud_talk
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
         }
-    }
+    });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -1705,6 +1718,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1759,6 +1773,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2130,6 +2145,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2199,6 +2215,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let headers = HeaderMap::new();
@@ -2280,6 +2297,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let response = handle_webhook(
@@ -2333,6 +2351,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2391,6 +2410,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2454,6 +2474,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2513,6 +2534,7 @@ mod tests {
             max_ws_connections: 0,
             sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sse_connections: 0,
+            ws_rate_limit_per_minute: 0,
         };
 
         let mut headers = HeaderMap::new();

@@ -5180,6 +5180,10 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
+                // Validate early so the user gets immediate feedback
+                if let Err(e) = crate::tunnel::custom::validate_start_command(&cmd) {
+                    anyhow::bail!("Invalid custom tunnel command: {e}");
+                }
                 println!(
                     "  {} Tunnel: {} ({})",
                     style("✓").green().bold(),

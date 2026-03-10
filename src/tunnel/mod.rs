@@ -1,5 +1,5 @@
 mod cloudflare;
-mod custom;
+pub mod custom;
 mod ngrok;
 mod none;
 mod tailscale;
@@ -113,7 +113,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
                 cu.start_command.clone(),
                 cu.health_url.clone(),
                 cu.url_pattern.clone(),
-            ))))
+            )?)))
         }
 
         other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, custom"),
@@ -239,7 +239,7 @@ mod tests {
         let cfg = TunnelConfig {
             provider: "custom".into(),
             custom: Some(CustomTunnelConfig {
-                start_command: "echo tunnel".into(),
+                start_command: "bore local {port} --to bore.pub".into(),
                 health_url: None,
                 url_pattern: None,
             }),
@@ -248,6 +248,34 @@ mod tests {
         let t = create_tunnel(&cfg).unwrap();
         assert!(t.is_some());
         assert_eq!(t.unwrap().name(), "custom");
+    }
+
+    #[test]
+    fn factory_custom_rejects_disallowed_binary() {
+        let cfg = TunnelConfig {
+            provider: "custom".into(),
+            custom: Some(CustomTunnelConfig {
+                start_command: "curl http://evil.com".into(),
+                health_url: None,
+                url_pattern: None,
+            }),
+            ..TunnelConfig::default()
+        };
+        assert_tunnel_err(&cfg, "known tunnel binary");
+    }
+
+    #[test]
+    fn factory_custom_rejects_metacharacters() {
+        let cfg = TunnelConfig {
+            provider: "custom".into(),
+            custom: Some(CustomTunnelConfig {
+                start_command: "bore local 8080 ; rm -rf /".into(),
+                health_url: None,
+                url_pattern: None,
+            }),
+            ..TunnelConfig::default()
+        };
+        assert_tunnel_err(&cfg, "shell metacharacters");
     }
 
     #[test]
@@ -310,7 +338,7 @@ mod tests {
 
     #[test]
     fn custom_tunnel_name() {
-        let t = CustomTunnel::new("echo hi".into(), None, None);
+        let t = CustomTunnel::new("bore local 8080".into(), None, None).unwrap();
         assert_eq!(t.name(), "custom");
         assert!(t.public_url().is_none());
     }
@@ -369,7 +397,8 @@ mod tests {
 
     #[tokio::test]
     async fn custom_health_false_before_start_without_health_url() {
-        let tunnel = CustomTunnel::new("echo hi".into(), None, Some("https://".into()));
+        let tunnel =
+            CustomTunnel::new("bore local 8080".into(), None, Some("https://".into())).unwrap();
         assert!(!tunnel.health_check().await);
     }
 }

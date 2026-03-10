@@ -60,6 +60,8 @@ impl HttpRequestTool {
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
+        validate_resolved_host_is_public(&host)?;
+
         Ok(url.to_string())
     }
 
@@ -446,6 +448,47 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+}
+
+/// DNS-rebinding protection: resolve the hostname and verify all resolved IPs
+/// are globally routable. This prevents an attacker from pointing a domain at
+/// 127.0.0.1 or other private addresses.
+#[cfg(not(test))]
+fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+
+    let ips = (host, 0)
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve host '{host}': {e}"))?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+
+    validate_resolved_ips_are_public(host, &ips)
+}
+
+#[cfg(test)]
+fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+    // DNS resolution is skipped in tests; IP validation is covered by
+    // validate_resolved_ips_are_public unit tests below.
+    Ok(())
+}
+
+fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> anyhow::Result<()> {
+    if ips.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    for ip in ips {
+        let non_global = match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(*v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
+        };
+        if non_global {
+            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -934,5 +977,102 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    // ── DNS rebinding protection (validate_resolved_ips_are_public) ──
+
+    #[test]
+    fn resolved_private_ip_is_rejected() {
+        let ips = vec!["127.0.0.1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_rfc1918_ip_is_rejected() {
+        for addr in ["10.0.0.1", "172.16.0.1", "192.168.1.1"] {
+            let ips = vec![addr.parse().unwrap()];
+            let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("non-global address"),
+                "Expected rejection for {addr}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_link_local_ip_is_rejected() {
+        let ips = vec!["169.254.1.1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_ipv6_loopback_is_rejected() {
+        let ips = vec!["::1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_ipv6_unique_local_is_rejected() {
+        let ips = vec!["fd00::1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_ipv6_link_local_is_rejected() {
+        let ips = vec!["fe80::1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_mixed_ips_rejected_if_any_private() {
+        let ips = vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_public_ips_are_allowed() {
+        let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        assert!(validate_resolved_ips_are_public("example.com", &ips).is_ok());
+    }
+
+    #[test]
+    fn resolved_empty_ips_rejected() {
+        let ips: Vec<std::net::IpAddr> = vec![];
+        let err = validate_resolved_ips_are_public("no-records.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Failed to resolve"));
+    }
+
+    #[test]
+    fn resolved_unspecified_is_rejected() {
+        let ips = vec!["0.0.0.0".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("evil.example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
     }
 }

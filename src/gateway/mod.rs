@@ -1374,12 +1374,26 @@ async fn handle_linq_webhook(
 }
 
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
+///
+/// Validates the verify token before echoing the challenge to prevent
+/// spoofable webhook registration from untrusted parties.
 async fn handle_wati_verify(
     State(state): State<AppState>,
     Query(params): Query<WatiVerifyQuery>,
 ) -> impl IntoResponse {
     if state.wati.is_none() {
         return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
+    }
+
+    // Validate the verify token if webhook_secret is configured.
+    // Without this check, any attacker could register their endpoint by
+    // sending a crafted GET request with an arbitrary challenge.
+    if let Some(ref expected_token) = state.wati_webhook_secret {
+        let provided = params.verify_token.as_deref().unwrap_or("");
+        if !crate::security::pairing::constant_time_eq(provided, expected_token) {
+            tracing::warn!("WATI webhook verify: token mismatch");
+            return (StatusCode::FORBIDDEN, "Invalid verify token".to_string());
+        }
     }
 
     // WATI may use Meta-style webhook verification; echo the challenge
@@ -1393,6 +1407,8 @@ async fn handle_wati_verify(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct WatiVerifyQuery {
+    #[serde(rename = "hub.verify_token")]
+    pub verify_token: Option<String>,
     #[serde(rename = "hub.challenge")]
     pub challenge: Option<String>,
 }

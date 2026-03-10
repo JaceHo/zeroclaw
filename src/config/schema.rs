@@ -4512,6 +4512,43 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
+        // Tunnel: validate custom start_command to prevent obvious command injection
+        if self.tunnel.provider == "custom" {
+            if let Some(ref custom) = self.tunnel.custom {
+                let cmd = custom.start_command.trim();
+                if cmd.is_empty() {
+                    anyhow::bail!("tunnel.custom.start_command must not be empty");
+                }
+                // Block shell metacharacters that could enable injection via
+                // config.toml manipulation (the command is split by whitespace
+                // and passed to Command::new, not a shell, but these chars are
+                // still suspicious and indicate misconfiguration).
+                const DANGEROUS_CHARS: &[char] = &['|', ';', '&', '$', '`', '(', ')', '<', '>'];
+                if cmd.contains(DANGEROUS_CHARS) {
+                    anyhow::bail!(
+                        "tunnel.custom.start_command contains shell metacharacters (|;&$`()<>); \
+                         use a wrapper script if complex shell logic is needed"
+                    );
+                }
+            } else {
+                anyhow::bail!(
+                    "tunnel.provider = \"custom\" but [tunnel.custom] section is missing"
+                );
+            }
+        }
+
+        // Warn (but don't fail) when connection limits are set to unlimited
+        if self.gateway.max_ws_connections == 0 {
+            tracing::warn!(
+                "gateway.max_ws_connections = 0 (unlimited) — no DoS mitigation for WebSocket connections"
+            );
+        }
+        if self.gateway.max_sse_connections == 0 {
+            tracing::warn!(
+                "gateway.max_sse_connections = 0 (unlimited) — no DoS mitigation for SSE connections"
+            );
+        }
+
         Ok(())
     }
 

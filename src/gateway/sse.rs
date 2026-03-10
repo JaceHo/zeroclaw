@@ -203,7 +203,39 @@ impl crate::observability::Observer for BroadcastObserver {
                 "cost_usd": cost_usd,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
-            _ => return, // Skip events we don't broadcast
+            crate::observability::ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => serde_json::json!({
+                "type": "llm_response",
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration.as_millis(),
+                "success": success,
+                "error_message": error_message,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            crate::observability::ObserverEvent::TurnComplete => serde_json::json!({
+                "type": "turn_complete",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            crate::observability::ObserverEvent::ChannelMessage {
+                channel,
+                direction,
+            } => serde_json::json!({
+                "type": "channel_message",
+                "channel": channel,
+                "direction": direction,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            _ => return, // Skip HeartbeatTick and other internal events
         };
 
         self.tx.publish(json);

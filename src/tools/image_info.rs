@@ -177,7 +177,7 @@ impl Tool for ImageInfoTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Access denied: resolved path is outside workspace")),
+                        error: Some("Access denied: resolved path is outside workspace".to_string()),
                     });
                 }
             }

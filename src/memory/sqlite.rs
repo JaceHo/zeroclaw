@@ -70,8 +70,8 @@ impl SqliteMemory {
         // ── Production-grade PRAGMA tuning ──────────────────────
         // WAL mode: concurrent reads during writes, crash-safe
         // normal sync: 2× write speed, still durable on WAL
-        // mmap 8 MB: let the OS page-cache serve hot reads
-        // cache 2 MB: keep ~500 hot pages in-process
+        // mmap 64 MB: let the OS page-cache serve hot reads
+        // cache ~8 MB: keep ~2000 hot pages in-process (-N = KiB)
         // temp_store memory: temp tables never hit disk
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;

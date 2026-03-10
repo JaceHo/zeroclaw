@@ -22,7 +22,7 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: () => {},
 });
 

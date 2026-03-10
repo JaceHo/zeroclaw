@@ -112,12 +112,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         let provider_label = &ctx.provider_name;
 
-        // Broadcast agent_start event
-        state.event_tx.publish(serde_json::json!({
-            "type": "agent_start",
-            "provider": provider_label,
-            "model": state.model,
-        }));
+        // Broadcast agent_start event via observer (adds timestamp + metrics)
+        state.observer.record_event(
+            &crate::observability::ObserverEvent::AgentStart {
+                provider: provider_label.to_string(),
+                model: state.model.clone(),
+            },
+        );
 
         // Auto-save to memory (gateway webhook handlers do their own;
         // the WS handler uses the generic key like the CLI REPL).
@@ -169,11 +170,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .send(Message::Text(done.to_string().into()))
                     .await;
 
-                state.event_tx.publish(serde_json::json!({
-                    "type": "agent_end",
-                    "provider": provider_label,
-                    "model": state.model,
-                }));
+                state.observer.record_event(
+                    &crate::observability::ObserverEvent::AgentEnd {
+                        provider: provider_label.to_string(),
+                        model: state.model.clone(),
+                        duration: std::time::Duration::ZERO,
+                        tokens_used: None,
+                        cost_usd: None,
+                    },
+                );
             }
             Err(e) => {
                 // Abort relay on error
@@ -190,11 +195,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .send(Message::Text(err.to_string().into()))
                     .await;
 
-                state.event_tx.publish(serde_json::json!({
-                    "type": "error",
-                    "component": "ws_chat",
-                    "message": sanitized,
-                }));
+                state.observer.record_event(
+                    &crate::observability::ObserverEvent::Error {
+                        component: "ws_chat".to_string(),
+                        message: sanitized.to_string(),
+                    },
+                );
             }
         }
     }

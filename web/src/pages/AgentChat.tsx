@@ -14,16 +14,23 @@ export default function AgentChat() {
 
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Auto-scroll only when user is near the bottom (not reading history)
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = containerRef.current;
+    if (!container) return;
+    const isNearBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+    if (isNearBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages, streamingContent, typing]);
 
   const handleSend = () => {
-    const trimmed = input.trim();
-    if (!trimmed || !connected) return;
-    sendMessage(trimmed);
+    if (!input.trim() || !connected) return;
+    sendMessage(input);
     setInput('');
     inputRef.current?.focus();
   };
@@ -46,7 +53,7 @@ export default function AgentChat() {
       )}
 
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div ref={containerRef} className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && !typing && (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <Bot className="h-12 w-12 mb-3 text-gray-600" />

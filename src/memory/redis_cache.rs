@@ -71,8 +71,9 @@ impl ResponseCacheBackend for RedisResponseCache {
                 // Bump stats atomically
                 let token_count: u64 = conn.get(&tkey).await.unwrap_or(0);
                 let _: () = conn.incr(&hits_key, 1i64).await.unwrap_or(());
+                let safe_count = i64::try_from(token_count).unwrap_or(i64::MAX);
                 let _: () = conn
-                    .incr(&tokens_key, token_count as i64)
+                    .incr(&tokens_key, safe_count)
                     .await
                     .unwrap_or(());
             }
@@ -84,14 +85,10 @@ impl ResponseCacheBackend for RedisResponseCache {
     fn put(&self, key: &str, _model: &str, response: &str, token_count: u32) -> Result<()> {
         let rkey = self.response_key(key);
         let tkey = self.tokens_key(key);
-        let entries_key = self.stats_entries_key();
         let mut conn = self.conn.clone();
         let ttl = self.ttl_secs;
 
         self.block_on(async {
-            // Check if key already exists (to track net new entries)
-            let exists: bool = conn.exists(&rkey).await.unwrap_or(false);
-
             // Store response with TTL
             let _: () = conn
                 .set_ex(&rkey, response, ttl)
@@ -104,29 +101,44 @@ impl ResponseCacheBackend for RedisResponseCache {
                 .await
                 .context("Redis SET EX (tokens) failed")?;
 
-            // Track total entries (only increment for new keys)
-            if !exists {
-                let _: () = conn.incr(&entries_key, 1i64).await.unwrap_or(());
-            }
-
             Ok(())
         })
     }
 
     fn stats(&self) -> Result<(usize, u64, u64)> {
-        let entries_key = self.stats_entries_key();
         let hits_key = self.stats_hits_key();
         let tokens_key = self.stats_tokens_key();
+        let pattern = format!("{}cache:*", self.prefix);
         let mut conn = self.conn.clone();
 
         self.block_on(async {
-            let entries: i64 = conn.get(&entries_key).await.unwrap_or(0);
+            // Count live cache keys via SCAN instead of relying on an INCR
+            // counter that drifts upward as entries expire via TTL.
+            let mut live_count: usize = 0;
+            let mut cursor: u64 = 0;
+            loop {
+                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(100)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or((0, Vec::new()));
+                live_count += keys.len();
+                cursor = next_cursor;
+                if cursor == 0 {
+                    break;
+                }
+            }
+
             let hits: i64 = conn.get(&hits_key).await.unwrap_or(0);
             let tokens_saved: i64 = conn.get(&tokens_key).await.unwrap_or(0);
 
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok((
-                entries.max(0) as usize,
+                live_count,
                 hits.max(0) as u64,
                 tokens_saved.max(0) as u64,
             ))

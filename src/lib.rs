@@ -62,6 +62,8 @@ pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
+#[cfg(feature = "redis")]
+pub(crate) mod redis_conn;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;

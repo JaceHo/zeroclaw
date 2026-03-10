@@ -74,6 +74,8 @@ mod observability;
 mod onboard;
 mod peripherals;
 mod providers;
+#[cfg(feature = "redis")]
+mod redis_conn;
 mod runtime;
 mod security;
 mod service;

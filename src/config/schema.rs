@@ -217,6 +217,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Redis infrastructure configuration for event bus and response cache (`[redis]`).
+    #[serde(default)]
+    pub redis: RedisConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -269,11 +273,11 @@ pub struct DelegateAgentConfig {
 }
 
 fn default_max_depth() -> u32 {
-    3
+    5
 }
 
 fn default_max_tool_iterations() -> usize {
-    10
+    25
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -414,11 +418,11 @@ pub struct AgentConfig {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    10
+    25
 }
 
 fn default_agent_max_history_messages() -> usize {
-    50
+    100
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -431,7 +435,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
-            parallel_tools: false,
+            parallel_tools: true,
             tool_dispatcher: default_agent_tool_dispatcher(),
         }
     }
@@ -811,11 +815,11 @@ fn default_gateway_host() -> String {
 }
 
 fn default_pair_rate_limit() -> u32 {
-    10
+    30
 }
 
 fn default_webhook_rate_limit() -> u32 {
-    60
+    300
 }
 
 fn default_idempotency_ttl_secs() -> u64 {
@@ -848,6 +852,59 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+        }
+    }
+}
+
+// ── Redis (opt-in infrastructure) ────────────────────────────────
+
+/// Redis configuration for opt-in event bus pub/sub and response caching (`[redis]` section).
+///
+/// Requires the `redis` feature flag at compile time. When `enabled = false` (default),
+/// all behavior falls back to in-process channels and SQLite caching.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RedisConfig {
+    /// Enable Redis integration (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Redis connection URL (default: "redis://127.0.0.1:6379")
+    #[serde(default = "default_redis_url")]
+    pub url: String,
+    /// Key prefix for all Redis keys (default: "zeroclaw:")
+    #[serde(default = "default_redis_prefix")]
+    pub key_prefix: String,
+    /// Use Redis pub/sub for the SSE/WS event bus (default: false)
+    #[serde(default)]
+    pub event_bus: bool,
+    /// Redis pub/sub channel name for events (default: "zeroclaw:events")
+    #[serde(default = "default_redis_event_channel")]
+    pub event_channel: String,
+    /// Use Redis for the response cache backend (default: false)
+    #[serde(default)]
+    pub response_cache: bool,
+}
+
+fn default_redis_url() -> String {
+    "redis://127.0.0.1:6379".into()
+}
+
+fn default_redis_prefix() -> String {
+    "zeroclaw:".into()
+}
+
+fn default_redis_event_channel() -> String {
+    "zeroclaw:events".into()
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_redis_url(),
+            key_prefix: default_redis_prefix(),
+            event_bus: false,
+            event_channel: default_redis_event_channel(),
+            response_cache: false,
         }
     }
 }
@@ -1822,16 +1879,16 @@ fn default_min_relevance_score() -> f64 {
     0.4
 }
 fn default_cache_size() -> usize {
-    10_000
+    50_000
 }
 fn default_chunk_size() -> usize {
-    512
+    1024
 }
 fn default_response_cache_ttl() -> u32 {
-    60
+    120
 }
 fn default_response_cache_max() -> usize {
-    5_000
+    20_000
 }
 
 impl Default for MemoryConfig {
@@ -1851,7 +1908,7 @@ impl Default for MemoryConfig {
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
-            response_cache_enabled: false,
+            response_cache_enabled: true,
             response_cache_ttl_minutes: default_response_cache_ttl(),
             response_cache_max_entries: default_response_cache_max(),
             snapshot_enabled: false,
@@ -2219,11 +2276,11 @@ pub struct ReliabilityConfig {
 }
 
 fn default_provider_retries() -> u32 {
-    2
+    3
 }
 
 fn default_provider_backoff_ms() -> u64 {
-    500
+    250
 }
 
 fn default_channel_backoff_secs() -> u64 {
@@ -2235,7 +2292,7 @@ fn default_channel_backoff_max_secs() -> u64 {
 }
 
 fn default_scheduler_poll_secs() -> u64 {
-    15
+    5
 }
 
 fn default_scheduler_retries() -> u32 {
@@ -2279,11 +2336,11 @@ fn default_scheduler_enabled() -> bool {
 }
 
 fn default_scheduler_max_tasks() -> usize {
-    64
+    256
 }
 
 fn default_scheduler_max_concurrent() -> usize {
-    4
+    16
 }
 
 impl Default for SchedulerConfig {
@@ -3437,15 +3494,15 @@ pub struct ResourceLimitsConfig {
 }
 
 fn default_max_memory_mb() -> u32 {
-    512
+    2048
 }
 
 fn default_max_cpu_time_seconds() -> u64 {
-    60
+    180
 }
 
 fn default_max_subprocesses() -> u32 {
-    10
+    32
 }
 
 fn default_memory_monitoring_enabled() -> bool {
@@ -3629,6 +3686,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            redis: RedisConfig::default(),
         }
     }
 }
@@ -5161,6 +5219,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            redis: RedisConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5256,9 +5315,9 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
-        assert_eq!(cfg.max_history_messages, 50);
-        assert!(!cfg.parallel_tools);
+        assert_eq!(cfg.max_tool_iterations, 25);
+        assert_eq!(cfg.max_history_messages, 100);
+        assert!(cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
 
@@ -5279,6 +5338,48 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+    }
+
+    #[test]
+    async fn redis_config_defaults() {
+        let cfg = RedisConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.url, "redis://127.0.0.1:6379");
+        assert_eq!(cfg.key_prefix, "zeroclaw:");
+        assert!(!cfg.event_bus);
+        assert_eq!(cfg.event_channel, "zeroclaw:events");
+        assert!(!cfg.response_cache);
+    }
+
+    #[test]
+    async fn redis_config_toml_roundtrip() {
+        let raw = r#"
+default_temperature = 0.7
+[redis]
+enabled = true
+url = "redis://10.0.0.5:6380/2"
+key_prefix = "myapp:"
+event_bus = true
+event_channel = "myapp:events"
+response_cache = true
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.redis.enabled);
+        assert_eq!(parsed.redis.url, "redis://10.0.0.5:6380/2");
+        assert_eq!(parsed.redis.key_prefix, "myapp:");
+        assert!(parsed.redis.event_bus);
+        assert_eq!(parsed.redis.event_channel, "myapp:events");
+        assert!(parsed.redis.response_cache);
+    }
+
+    #[test]
+    async fn redis_config_absent_uses_defaults() {
+        let raw = r#"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(!parsed.redis.enabled);
+        assert_eq!(parsed.redis.url, "redis://127.0.0.1:6379");
     }
 
     #[tokio::test]
@@ -5343,6 +5444,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            redis: RedisConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5965,8 +6067,8 @@ channel_id = "C123"
             g.paired_tokens.is_empty(),
             "No pre-paired tokens by default"
         );
-        assert_eq!(g.pair_rate_limit_per_minute, 10);
-        assert_eq!(g.webhook_rate_limit_per_minute, 60);
+        assert_eq!(g.pair_rate_limit_per_minute, 30);
+        assert_eq!(g.webhook_rate_limit_per_minute, 300);
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);

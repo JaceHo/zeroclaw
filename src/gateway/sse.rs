@@ -12,6 +12,7 @@ use axum::{
     },
 };
 use std::convert::Infallible;
+use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -53,20 +54,24 @@ pub async fn handle_sse_events(
     );
 
     Sse::new(stream)
-        .keep_alive(KeepAlive::default())
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
         .into_response()
 }
 
-/// Broadcast observer that forwards events to the SSE broadcast channel.
+/// Broadcast observer that forwards events to the SSE event bus.
 pub struct BroadcastObserver {
     inner: Box<dyn crate::observability::Observer>,
-    tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    tx: std::sync::Arc<dyn super::event_bus::EventBus>,
 }
 
 impl BroadcastObserver {
     pub fn new(
         inner: Box<dyn crate::observability::Observer>,
-        tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+        tx: std::sync::Arc<dyn super::event_bus::EventBus>,
     ) -> Self {
         Self { inner, tx }
     }
@@ -137,7 +142,7 @@ impl crate::observability::Observer for BroadcastObserver {
             _ => return, // Skip events we don't broadcast
         };
 
-        let _ = self.tx.send(json);
+        self.tx.publish(json);
     }
 
     fn record_metric(&self, metric: &crate::observability::traits::ObserverMetric) {

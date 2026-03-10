@@ -8,6 +8,9 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod event_bus;
+#[cfg(feature = "redis")]
+pub mod redis_bus;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -43,10 +46,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
-/// Maximum request body size (64KB) — prevents memory exhaustion
-pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Maximum request body size (128KB) — prevents memory exhaustion
+pub const MAX_BODY_SIZE: usize = 131_072;
+/// Request timeout (60s) — headroom for webhook endpoints triggering LLM processing
+pub const REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -308,8 +311,8 @@ pub struct AppState {
     pub tools_registry: Arc<Vec<ToolSpec>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
-    /// SSE broadcast channel for real-time events
-    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Event bus for real-time SSE/WS event delivery (in-process or Redis-backed).
+    pub event_tx: Arc<dyn event_bus::EventBus>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -409,8 +412,33 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
-    // SSE broadcast channel for real-time events
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    // SSE/WS event bus (Redis pub/sub or in-process broadcast)
+    let event_tx: Arc<dyn event_bus::EventBus> = {
+        #[cfg(feature = "redis")]
+        {
+            if config.redis.enabled && config.redis.event_bus {
+                let conn = crate::redis_conn::create_connection_manager(&config.redis).await?;
+                let bus = redis_bus::RedisEventBus::new(
+                    conn,
+                    &config.redis.url,
+                    config.redis.event_channel.clone(),
+                    1024,
+                )
+                .await?;
+                tracing::info!(
+                    "📡 Redis event bus active (channel: {})",
+                    config.redis.event_channel
+                );
+                Arc::new(bus)
+            } else {
+                Arc::new(event_bus::TokioBroadcastBus::new(1024))
+            }
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            Arc::new(event_bus::TokioBroadcastBus::new(1024))
+        }
+    };
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -619,7 +647,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let broadcast_observer: Arc<dyn crate::observability::Observer> =
         Arc::new(sse::BroadcastObserver::new(
             crate::observability::create_observer(&config.observability),
-            event_tx.clone(),
+            Arc::clone(&event_tx),
         ));
 
     let state = AppState {
@@ -1538,13 +1566,13 @@ mod tests {
     }
 
     #[test]
-    fn security_body_limit_is_64kb() {
-        assert_eq!(MAX_BODY_SIZE, 65_536);
+    fn security_body_limit_is_128kb() {
+        assert_eq!(MAX_BODY_SIZE, 131_072);
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_60_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 60);
     }
 
     #[test]
@@ -1599,7 +1627,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1648,7 +1676,7 @@ mod tests {
             observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2014,7 +2042,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2078,7 +2106,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let headers = HeaderMap::new();
@@ -2154,7 +2182,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let response = handle_webhook(
@@ -2202,7 +2230,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2255,7 +2283,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2313,7 +2341,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2367,7 +2395,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
         };
 
         let mut headers = HeaderMap::new();

@@ -21,11 +21,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
-const STREAM_CHUNK_MIN_CHARS: usize = 80;
+const STREAM_CHUNK_MIN_CHARS: usize = 40;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 25;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -88,19 +88,19 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
-const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 100;
 
 /// Keep this many most-recent non-system messages after compaction.
-const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
+const COMPACTION_KEEP_RECENT_MESSAGES: usize = 40;
 
 /// Safety cap for compaction source transcript passed to the summarizer.
-const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
+const COMPACTION_MAX_SOURCE_CHARS: usize = 24_000;
 
 /// Max characters retained in stored compaction summary.
-const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 4_000;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
-pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 150;
 
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
@@ -146,21 +146,24 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
+    // Pin prefix: always keep the system prompt (if present) AND the first user
+    // message so the agent never loses sight of the original request/goal.
     let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
+    let first_user_idx = history.iter().position(|m| m.role == "user");
+    let pinned = match (has_system, first_user_idx) {
+        (true, Some(idx)) if idx > 0 => idx + 1, // system + first user
+        (true, _) => 1,                          // system only
+        (false, Some(0)) => 1,                   // first user (no system)
+        _ => 0,
     };
 
-    if non_system_count <= max_history {
+    let trimmable = history.len().saturating_sub(pinned);
+    if trimmable <= max_history {
         return;
     }
 
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let to_remove = trimmable - max_history;
+    history.drain(pinned..pinned + to_remove);
 }
 
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
@@ -3210,188 +3213,312 @@ pub async fn run(
     Ok(final_output)
 }
 
+/// Reusable agent session context.
+///
+/// Holds all infrastructure (provider, tools, memory, observer, etc.) needed to
+/// run multi-turn agent conversations.  Built once per session via
+/// [`AgentSessionContext::from_config`], then reused across turns via
+/// [`AgentSessionContext::process_turn`].
+pub struct AgentSessionContext {
+    pub(crate) observer: Arc<dyn Observer>,
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) provider_name: String,
+    pub(crate) model_name: String,
+    pub(crate) temperature: f64,
+    pub(crate) tools_registry: Vec<Box<dyn Tool>>,
+    pub(crate) mem: Arc<dyn Memory>,
+    pub(crate) system_prompt: String,
+    pub(crate) hardware_rag: Option<crate::rag::HardwareRag>,
+    pub(crate) board_names: Vec<String>,
+    pub(crate) multimodal_config: crate::config::MultimodalConfig,
+    pub(crate) max_tool_iterations: usize,
+    pub(crate) max_history_messages: usize,
+    pub(crate) min_relevance_score: f64,
+    pub(crate) compact_context: bool,
+    pub(crate) auto_save: bool,
+}
+
+impl AgentSessionContext {
+    /// Build a fully-wired agent session from a [`Config`].
+    ///
+    /// This is the shared setup extracted from `process_message` / `run` — it
+    /// creates the observer, runtime, security policy, memory backend, tool
+    /// registry, provider, hardware RAG, and system prompt once so they can be
+    /// reused across multiple turns.
+    pub async fn from_config(config: &Config) -> Result<Self> {
+        let observer: Arc<dyn Observer> =
+            Arc::from(observability::create_observer(&config.observability));
+        let runtime: Arc<dyn runtime::RuntimeAdapter> =
+            Arc::from(runtime::create_runtime(&config.runtime)?);
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?);
+
+        let (composio_key, composio_entity_id) = if config.composio.enabled {
+            (
+                config.composio.api_key.as_deref(),
+                Some(config.composio.entity_id.as_str()),
+            )
+        } else {
+            (None, None)
+        };
+        let mut tools_registry = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            mem.clone(),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            config,
+        );
+        let peripheral_tools: Vec<Box<dyn Tool>> =
+            crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+        tools_registry.extend(peripheral_tools);
+
+        let provider_name = config
+            .default_provider
+            .as_deref()
+            .unwrap_or("openrouter")
+            .to_string();
+        let model_name = config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+        };
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+            &provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+
+        let hardware_rag: Option<crate::rag::HardwareRag> = config
+            .peripherals
+            .datasheet_dir
+            .as_ref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+            .and_then(Result::ok)
+            .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+        let board_names: Vec<String> = config
+            .peripherals
+            .boards
+            .iter()
+            .map(|b| b.board.clone())
+            .collect();
+
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
+        let mut tool_descs: Vec<(&str, &str)> = vec![
+            ("shell", "Execute terminal commands."),
+            ("file_read", "Read file contents."),
+            ("file_write", "Write file contents."),
+            ("memory_store", "Save to memory."),
+            ("memory_recall", "Search memory."),
+            ("memory_forget", "Delete a memory entry."),
+            (
+                "model_routing_config",
+                "Configure default model, scenario routing, and delegate agents.",
+            ),
+            ("screenshot", "Capture a screenshot."),
+            ("image_info", "Read image metadata."),
+        ];
+        if config.browser.enabled {
+            tool_descs.push(("browser_open", "Open approved URLs in browser."));
+        }
+        if config.composio.enabled {
+            tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+        }
+        if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
+            tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
+            tool_descs.push((
+                "gpio_write",
+                "Set GPIO pin high or low on connected hardware.",
+            ));
+            tool_descs.push((
+                "arduino_upload",
+                "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+            ));
+            tool_descs.push((
+                "hardware_memory_map",
+                "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
+            ));
+            tool_descs.push((
+                "hardware_board_info",
+                "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+            ));
+            tool_descs.push((
+                "hardware_memory_read",
+                "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
+            ));
+            tool_descs.push((
+                "hardware_capabilities",
+                "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
+            ));
+        }
+        let bootstrap_max_chars = if config.agent.compact_context {
+            Some(6000)
+        } else {
+            None
+        };
+        let native_tools = provider.supports_native_tools();
+        let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+            &config.workspace_dir,
+            &model_name,
+            &tool_descs,
+            &skills,
+            Some(&config.identity),
+            bootstrap_max_chars,
+            native_tools,
+            config.skills.prompt_injection_mode,
+        );
+        if !native_tools {
+            system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        }
+
+        Ok(Self {
+            observer,
+            provider,
+            provider_name,
+            model_name,
+            temperature: config.default_temperature,
+            tools_registry,
+            mem,
+            system_prompt,
+            hardware_rag,
+            board_names,
+            multimodal_config: config.multimodal.clone(),
+            max_tool_iterations: config.agent.max_tool_iterations,
+            max_history_messages: config.agent.max_history_messages,
+            min_relevance_score: config.memory.min_relevance_score,
+            compact_context: config.agent.compact_context,
+            auto_save: config.memory.auto_save,
+        })
+    }
+
+    /// Return initial history with the system prompt.
+    pub fn initial_history(&self) -> Vec<ChatMessage> {
+        vec![ChatMessage::system(&self.system_prompt)]
+    }
+
+    /// Auto-save a user message to conversation memory.
+    ///
+    /// Callers that already save via channel-specific keys (WhatsApp, Linq, etc.)
+    /// should skip this to avoid double-saving.  The WS handler and other
+    /// direct callers should call this before [`process_turn`].
+    pub async fn auto_save_user_message(&self, message: &str) {
+        if self.auto_save && message.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let user_key = autosave_memory_key("user_msg");
+            let _ = self
+                .mem
+                .store(&user_key, message, MemoryCategory::Conversation, None)
+                .await;
+        }
+    }
+
+    /// Process a single user turn within an ongoing session.
+    ///
+    /// This enriches the message with memory + hardware RAG context, appends it
+    /// to `history`, runs the agent tool-call loop, performs auto-compaction,
+    /// and trims history.  The assistant response text is returned.
+    pub async fn process_turn(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        message: &str,
+    ) -> Result<String> {
+        self.process_turn_streaming(history, message, None).await
+    }
+
+    /// Like [`process_turn`](Self::process_turn), but accepts an optional
+    /// `on_delta` sender for streaming token deltas to the caller (e.g. the
+    /// WebSocket relay task).
+    pub async fn process_turn_streaming(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        message: &str,
+        on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<String> {
+        // Inject memory + hardware RAG context into user message
+        let mem_context = build_context(self.mem.as_ref(), message, self.min_relevance_score).await;
+        let rag_limit = if self.compact_context { 2 } else { 5 };
+        let hw_context = self
+            .hardware_rag
+            .as_ref()
+            .map(|r| build_hardware_context(r, message, &self.board_names, rag_limit))
+            .unwrap_or_default();
+        let context = format!("{mem_context}{hw_context}");
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {message}")
+        } else {
+            format!("{context}[{now}] {message}")
+        };
+
+        history.push(ChatMessage::user(&enriched));
+
+        let response = run_tool_call_loop(
+            self.provider.as_ref(),
+            history,
+            &self.tools_registry,
+            self.observer.as_ref(),
+            &self.provider_name,
+            &self.model_name,
+            self.temperature,
+            true,
+            None,
+            "ws",
+            &self.multimodal_config,
+            self.max_tool_iterations,
+            None,
+            on_delta,
+            None,
+            &[],
+        )
+        .await?;
+
+        // Auto-compaction before hard trimming to preserve long-context signal.
+        let _ = auto_compact_history(
+            history,
+            self.provider.as_ref(),
+            &self.model_name,
+            self.max_history_messages,
+        )
+        .await;
+
+        // Hard cap as a safety net.
+        trim_history(history, self.max_history_messages);
+
+        Ok(response)
+    }
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
-
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let mut tools_registry = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
-
-    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-    };
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
-
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        (
-            "model_routing_config",
-            "Configure default model, scenario routing, and delegate agents.",
-        ),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
-    ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high or low on connected hardware.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
-        ));
-    }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
-    let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
-        &model_name,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
-        native_tools,
-        config.skills.prompt_injection_mode,
-    );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
-    }
-
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
-        .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let enriched = if context.is_empty() {
-        format!("[{now}] {message}")
-    } else {
-        format!("{context}[{now}] {message}")
-    };
-
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
-
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await
+    let ctx = AgentSessionContext::from_config(&config).await?;
+    let mut history = ctx.initial_history();
+    ctx.process_turn(&mut history, message).await
 }
 
 #[cfg(test)]
@@ -4639,7 +4766,7 @@ Tail"#;
     }
 
     #[test]
-    fn trim_history_preserves_system_prompt() {
+    fn trim_history_preserves_system_prompt_and_first_user() {
         let mut history = vec![ChatMessage::system("system prompt")];
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
@@ -4652,9 +4779,12 @@ Tail"#;
         // System prompt preserved
         assert_eq!(history[0].role, "system");
         assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                                     // Most recent messages preserved
+        // First user message (initial request) preserved
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "msg 0");
+        // Trimmed to limit (+2 for pinned system + first user)
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 2);
+        // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
             last.content,
@@ -4841,12 +4971,15 @@ Done."#;
             history.push(ChatMessage::user(format!("msg {i}")));
         }
         trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
+        // +1 for pinned first user message (initial request)
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1);
+        assert_eq!(history[0].content, "msg 0"); // initial request pinned
     }
 
     #[test]
     fn trim_history_preserves_role_ordering() {
         // Recovery: After trimming, role ordering should remain consistent
+        // and first user message is pinned.
         let mut history = vec![ChatMessage::system("system")];
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
             history.push(ChatMessage::user(format!("user {i}")));
@@ -4854,6 +4987,8 @@ Done."#;
         }
         trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "user 0"); // initial request pinned
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
 
@@ -5303,9 +5438,12 @@ Let me check the result."#;
             crate::providers::ChatMessage::assistant("new reply"),
         ];
         trim_history(&mut history, 2);
-        assert_eq!(history.len(), 3); // system + 2 kept
+        // system + pinned first user + 2 kept = 4
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "new msg");
+        assert_eq!(history[1].content, "old msg"); // initial request pinned
+        assert_eq!(history[2].content, "new msg");
+        assert_eq!(history[3].content, "new reply");
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,

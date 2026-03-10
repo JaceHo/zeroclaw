@@ -1,12 +1,14 @@
-//! WebSocket agent chat handler.
+//! WebSocket agent chat handler with full tool execution.
+//!
+//! Uses the same `process_message` agent loop as Telegram/Discord/WhatsApp,
+//! giving the web UI access to tools, memory, security policy, and hardware.
 //!
 //! Protocol:
 //! ```text
 //! Client -> Server: {"type":"message","content":"Hello"}
-//! Server -> Client: {"type":"chunk","content":"Hi! "}
-//! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
-//! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
+//! Server -> Client: {"type":"chunk","content":"<token>"}   (streaming delta)
 //! Server -> Client: {"type":"done","full_response":"..."}
+//! Server -> Client: {"type":"error","message":"..."}
 //! ```
 
 use super::AppState;
@@ -19,6 +21,8 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -48,7 +52,31 @@ pub async fn handle_ws_chat(
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
+    let (ws_sender, mut receiver) = socket.split();
+    let ws_sender = Arc::new(Mutex::new(ws_sender));
+
+    // Build session context once on connect — provider, tools, memory, etc.
+    // are reused across all turns in this WebSocket connection.
+    let config = state.config.lock().clone();
+    let ctx = match crate::agent::AgentSessionContext::from_config(&config).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Session init failed: {sanitized}"),
+            });
+            let _ = ws_sender
+                .lock()
+                .await
+                .send(Message::Text(err.to_string().into()))
+                .await;
+            return;
+        }
+    };
+
+    // Persistent conversation history for the lifetime of this connection.
+    let mut history = ctx.initial_history();
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -63,7 +91,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Ok(v) => v,
             Err(_) => {
                 let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = ws_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(err.to_string().into()))
+                    .await;
                 continue;
             }
         };
@@ -78,85 +110,87 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             continue;
         }
 
-        // Process message with the LLM provider
-        let provider_label = state
-            .config
-            .lock()
-            .default_provider
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let provider_label = &ctx.provider_name;
 
         // Broadcast agent_start event
-        let _ = state.event_tx.send(serde_json::json!({
+        state.event_tx.publish(serde_json::json!({
             "type": "agent_start",
             "provider": provider_label,
             "model": state.model,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
+        // Auto-save to memory (gateway webhook handlers do their own;
+        // the WS handler uses the generic key like the CLI REPL).
+        ctx.auto_save_user_message(&content).await;
 
-        let messages = vec![
-            crate::providers::ChatMessage::system(system_prompt),
-            crate::providers::ChatMessage::user(&content),
-        ];
+        // Create streaming delta channel
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(256);
 
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+        // Spawn relay task: reads token deltas and sends them as WebSocket chunk messages
+        let relay_sender = Arc::clone(&ws_sender);
+        let relay_task = tokio::spawn(async move {
+            while let Some(delta) = delta_rx.recv().await {
+                // Skip the clear sentinel — it is an internal signal for draft updaters
+                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
                     continue;
                 }
-            };
+                let chunk = serde_json::json!({
+                    "type": "chunk",
+                    "content": delta,
+                });
+                if relay_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(chunk.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break; // client disconnected
+                }
+            }
+        });
 
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        // Multi-turn agent loop with streaming: history persists across messages.
+        match ctx
+            .process_turn_streaming(&mut history, &content, Some(delta_tx))
             .await
         {
             Ok(response) => {
-                // Send the full response as a done message
+                // Wait for relay task to finish flushing remaining chunks
+                let _ = relay_task.await;
+
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
                 });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
+                let _ = ws_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(done.to_string().into()))
+                    .await;
 
-                // Broadcast agent_end event
-                let _ = state.event_tx.send(serde_json::json!({
+                state.event_tx.publish(serde_json::json!({
                     "type": "agent_end",
                     "provider": provider_label,
                     "model": state.model,
                 }));
             }
             Err(e) => {
+                // Abort relay on error
+                relay_task.abort();
+
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                 let err = serde_json::json!({
                     "type": "error",
                     "message": sanitized,
                 });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = ws_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(err.to_string().into()))
+                    .await;
 
-                // Broadcast error event
-                let _ = state.event_tx.send(serde_json::json!({
+                state.event_tx.publish(serde_json::json!({
                     "type": "error",
                     "component": "ws_chat",
                     "message": sanitized,

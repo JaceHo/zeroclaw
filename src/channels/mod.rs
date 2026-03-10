@@ -108,11 +108,11 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
-const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
-const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
+const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 8;
+const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 16;
+const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 128;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
-const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 15;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -1644,7 +1644,7 @@ async fn process_channel_message(
     );
 
     let (delta_tx, delta_rx) = if use_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
         (Some(tx), Some(rx))
     } else {
         (None, None)

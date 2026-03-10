@@ -26,7 +26,7 @@ pub fn classify_with_decision(
     }
 
     let lower = message.to_lowercase();
-    let len = message.len();
+    let len = message.chars().count();
 
     let mut rules: Vec<_> = config.rules.iter().collect();
     rules.sort_by(|a, b| b.priority.cmp(&a.priority));

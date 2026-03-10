@@ -4,9 +4,9 @@ import {
   useState,
   useCallback,
   useEffect,
+  useMemo,
   type ReactNode,
 } from 'react';
-import React from 'react';
 import {
   getToken as readToken,
   setToken as writeToken,
@@ -95,15 +95,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setAuthenticated(false);
   }, []);
 
-  const value: AuthState = {
-    token,
-    isAuthenticated: authenticated,
-    loading,
-    pair,
-    logout,
-  };
+  const value: AuthState = useMemo(
+    () => ({
+      token,
+      isAuthenticated: authenticated,
+      loading,
+      pair,
+      logout,
+    }),
+    [token, authenticated, loading, pair, logout],
+  );
 
-  return React.createElement(AuthContext.Provider, { value }, children);
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 // ---------------------------------------------------------------------------

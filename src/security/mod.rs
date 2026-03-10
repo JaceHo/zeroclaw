@@ -64,10 +64,11 @@ pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {
-    if value.len() <= 4 {
+    let prefix: String = value.chars().take(4).collect();
+    if prefix.len() < 4 || value.chars().count() <= 4 {
         "***".to_string()
     } else {
-        format!("{}***", &value[..4])
+        format!("{prefix}***")
     }
 }
 

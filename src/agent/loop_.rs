@@ -1966,10 +1966,11 @@ async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                let scrubbed = scrub_credentials(&reason);
                 Ok(ToolExecutionOutcome {
-                    output: format!("Error: {reason}"),
+                    output: format!("Error: {scrubbed}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed),
                     duration,
                 })
             }
@@ -1982,10 +1983,11 @@ async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
+            let scrubbed = scrub_credentials(&reason);
             Ok(ToolExecutionOutcome {
-                output: reason.clone(),
+                output: scrubbed.clone(),
                 success: false,
-                error_reason: Some(scrub_credentials(&reason)),
+                error_reason: Some(scrubbed),
                 duration,
             })
         }
@@ -2111,9 +2113,11 @@ pub(crate) async fn run_tool_call_loop(
         .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
-    let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     for iteration in 0..max_iterations {
+        // Reset dedup set each iteration — the LLM may legitimately re-request
+        // the same tool call after receiving new context from prior results.
+        let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)

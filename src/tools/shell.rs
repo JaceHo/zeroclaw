@@ -154,6 +154,12 @@ impl Tool for ShellTool {
             }
         }
 
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        // Use kill_on_drop so the child is killed if the future is cancelled
+        // or the Child handle is dropped, preventing orphaned processes.
+        cmd.kill_on_drop(true);
+
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
@@ -169,7 +175,7 @@ impl Tool for ShellTool {
                         b -= 1;
                     }
                     stdout.truncate(b);
-                    stdout.push_str("\n... [output truncated at 1MB]");
+                    stdout.push_str("\n... [output truncated at 2MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
                     let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
@@ -177,7 +183,7 @@ impl Tool for ShellTool {
                         b -= 1;
                     }
                     stderr.truncate(b);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
+                    stderr.push_str("\n... [stderr truncated at 2MB]");
                 }
 
                 Ok(ToolResult {
@@ -195,13 +201,16 @@ impl Tool for ShellTool {
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
-                )),
-            }),
+            Err(_) => {
+                // Child is killed automatically via kill_on_drop(true)
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    )),
+                })
+            }
         }
     }
 }

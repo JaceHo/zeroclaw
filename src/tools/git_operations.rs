@@ -96,9 +96,14 @@ impl GitOperationsTool {
             if line.starts_with("# branch.head ") {
                 branch = line.trim_start_matches("# branch.head ").to_string();
             } else if let Some(rest) = line.strip_prefix("1 ") {
-                // Ordinary changed entry
-                let mut parts = rest.splitn(3, ' ');
-                if let (Some(staging), Some(path)) = (parts.next(), parts.next()) {
+                // Ordinary changed entry: "1 XY sub mH mI mW hH hI path"
+                // After stripping "1 ", we have "XY sub mH mI mW hH hI path"
+                // Split into 9 parts to extract XY (index 0) and path (index 7)
+                let mut parts = rest.splitn(9, ' ');
+                let staging = parts.next();
+                // Skip sub, mH, mI, mW, hH, hI (6 fields) to reach the path
+                let path = parts.nth(6);
+                if let (Some(staging), Some(path)) = (staging, path) {
                     if !staging.is_empty() {
                         let status_char = staging.chars().next().unwrap_or(' ');
                         if status_char != '.' && status_char != ' ' {
@@ -227,7 +232,7 @@ impl GitOperationsTool {
         let mut commits = Vec::new();
 
         for line in output.lines() {
-            let parts: Vec<&str> = line.split('|').collect();
+            let parts: Vec<&str> = line.splitn(5, '|').collect();
             if parts.len() >= 5 {
                 commits.push(json!({
                     "hash": parts[0],

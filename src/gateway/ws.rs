@@ -77,11 +77,6 @@ pub async fn handle_ws_chat(
         .into_response()
 }
 
-/// Handle socket when connection limit is unlimited (no guard needed from caller).
-async fn handle_socket(socket: WebSocket, state: AppState) {
-    handle_socket_inner(socket, state, None).await;
-}
-
 /// Handle socket when the connection slot was already reserved by the caller.
 async fn handle_socket_with_guard(socket: WebSocket, state: AppState, guard: WsConnectionGuard) {
     handle_socket_inner(socket, state, Some(guard)).await;

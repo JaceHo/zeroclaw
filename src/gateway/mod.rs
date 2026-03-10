@@ -537,6 +537,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .and_then(|cfg| cfg.webhook_secret.as_deref())
         .filter(|s| !s.is_empty())
         .map(Arc::from);
+    // Security: warn if WATI is configured without webhook signature verification
+    if wati_channel.is_some() && wati_webhook_secret.is_none() {
+        tracing::warn!(
+            "WATI channel is configured without webhook_secret — any network peer can inject \
+             messages and trigger LLM costs. Set [channels.wati].webhook_secret to enable \
+             HMAC-SHA256 signature verification."
+        );
+    }
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =

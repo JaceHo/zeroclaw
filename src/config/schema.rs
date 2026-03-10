@@ -402,15 +402,15 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// Maximum tool-call loop turns per user message. Default: `25`.
+    /// Setting to `0` falls back to the safe default of `25`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
-    /// Maximum conversation history messages retained per session. Default: `50`.
+    /// Maximum conversation history messages retained per session. Default: `100`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
-    #[serde(default)]
+    /// Enable parallel tool execution within a single iteration. Default: `true`.
+    #[serde(default = "default_true")]
     pub parallel_tools: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
@@ -1484,6 +1484,16 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
     }
 
     false
+}
+
+/// Validate a Redis URL is parseable and uses a recognized scheme.
+fn redis_url_valid(url: &str) -> Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("'{url}' is not a valid URL"))?;
+    if !matches!(parsed.scheme(), "redis" | "rediss" | "redis+unix") {
+        anyhow::bail!("scheme '{}' not recognized; expected redis:// or rediss://", parsed.scheme());
+    }
+    Ok(())
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
@@ -4438,6 +4448,24 @@ impl Config {
             if !has_ollama_cloud_credential(self.api_key.as_deref()) {
                 anyhow::bail!(
                     "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                );
+            }
+        }
+
+        // Redis
+        if self.redis.enabled {
+            if self.redis.url.trim().is_empty() {
+                anyhow::bail!("redis.url must not be empty when redis.enabled = true");
+            }
+            if let Err(e) = redis_url_valid(&self.redis.url) {
+                anyhow::bail!("redis.url is invalid: {e}");
+            }
+            if self.redis.key_prefix.is_empty() {
+                anyhow::bail!("redis.key_prefix must not be empty when redis.enabled = true");
+            }
+            if self.redis.event_bus && self.redis.event_channel.trim().is_empty() {
+                anyhow::bail!(
+                    "redis.event_channel must not be empty when redis.event_bus = true"
                 );
             }
         }

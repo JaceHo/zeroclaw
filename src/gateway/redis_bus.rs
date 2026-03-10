@@ -36,13 +36,26 @@ impl RedisEventBus {
     ) -> anyhow::Result<Self> {
         let (local_tx, _) = broadcast::channel(capacity);
 
-        // Spawn background subscriber: opens its own connection for SUBSCRIBE.
+        // Spawn background subscriber with reconnection: opens its own connection for SUBSCRIBE.
         let relay_tx = local_tx.clone();
         let sub_channel = channel.clone();
         let client = redis::Client::open(redis_url)?;
         tokio::spawn(async move {
-            if let Err(e) = run_subscriber(client, &sub_channel, relay_tx).await {
-                tracing::error!("Redis event bus subscriber exited: {e}");
+            let mut backoff_secs = 1u64;
+            const MAX_BACKOFF_SECS: u64 = 30;
+            loop {
+                match run_subscriber(client.clone(), &sub_channel, relay_tx.clone()).await {
+                    Ok(()) => {
+                        tracing::warn!("Redis event bus subscriber stream ended, reconnecting...");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Redis event bus subscriber failed: {e}, retrying in {backoff_secs}s"
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             }
         });
 
@@ -91,12 +104,13 @@ async fn run_subscriber(
 
 impl EventBus for RedisEventBus {
     fn publish(&self, event: Value) {
-        // Local delivery (immediate, for same-process SSE subscribers).
-        let _ = self.local_tx.send(event.clone());
-
-        // Async Redis PUBLISH for cross-process delivery.
+        // Publish to Redis only — the background `run_subscriber` task relays
+        // messages back into `local_tx`, providing both local and cross-process
+        // delivery through a single path (avoids duplicate events for
+        // same-process SSE subscribers).
         let mut conn = self.conn.clone();
         let channel = self.channel.clone();
+        let local_tx = self.local_tx.clone();
         tokio::spawn(async move {
             let payload = event.to_string();
             let result: Result<(), redis::RedisError> = redis::cmd("PUBLISH")
@@ -105,7 +119,9 @@ impl EventBus for RedisEventBus {
                 .query_async(&mut conn)
                 .await;
             if let Err(e) = result {
-                tracing::warn!("Redis PUBLISH failed: {e}");
+                tracing::warn!("Redis PUBLISH failed, falling back to local delivery: {e}");
+                // Fallback: deliver locally when Redis is unreachable
+                let _ = local_tx.send(event);
             }
         });
     }

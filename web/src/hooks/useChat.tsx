@@ -5,6 +5,7 @@ import {
   useRef,
   useEffect,
   useCallback,
+  useMemo,
   type ReactNode,
 } from 'react';
 import React from 'react';
@@ -45,6 +46,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Ref to access current streaming content without stale closures
+  const streamingRef = useRef('');
+
   const wsRef = useRef<WebSocketClient | null>(null);
 
   useEffect(() => {
@@ -53,10 +57,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     ws.onOpen = () => {
       setConnected(true);
       setError(null);
+      // Reset streaming state on (re)connect to prevent stale partial content
+      setTyping(false);
+      setStreamingContent('');
+      streamingRef.current = '';
     };
 
     ws.onClose = () => {
       setConnected(false);
+      // Clean up streaming state so the UI doesn't show a permanently
+      // "typing" indicator with stale partial text.
+      setTyping(false);
+      setStreamingContent('');
+      streamingRef.current = '';
     };
 
     ws.onError = () => {
@@ -67,53 +80,33 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       switch (msg.type) {
         case 'chunk':
           setTyping(true);
-          setStreamingContent((prev) => prev + (msg.content ?? ''));
+          streamingRef.current += msg.content ?? '';
+          setStreamingContent(streamingRef.current);
           break;
 
         case 'message':
         case 'done': {
-          setStreamingContent((current) => {
-            const content = msg.full_response ?? msg.content ?? current;
-            if (content) {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: crypto.randomUUID(),
-                  role: 'agent',
-                  content,
-                  timestamp: new Date(),
-                },
-              ]);
-            }
-            return '';
-          });
+          // Use ref to read current streaming content (avoids nested setState).
+          const content = msg.full_response ?? msg.content ?? streamingRef.current;
+          if (content) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: 'agent',
+                content,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+          setStreamingContent('');
+          streamingRef.current = '';
           setTyping(false);
           break;
         }
 
-        case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: 'agent',
-              content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
-
-        case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: 'agent',
-              content: `[Tool Result] ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
+        // Note: tool_call/tool_result are reserved for future protocol
+        // extensions. The server currently only sends chunk/done/error.
 
         case 'error':
           setMessages((prev) => [
@@ -127,6 +120,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           ]);
           setTyping(false);
           setStreamingContent('');
+          streamingRef.current = '';
           break;
       }
     };
@@ -157,19 +151,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       setStreamingContent('');
+      streamingRef.current = '';
     } catch {
       setError('Failed to send message. Please try again.');
     }
   }, []);
 
-  const value: ChatState = {
-    messages,
-    streamingContent,
-    typing,
-    connected,
-    error,
-    sendMessage,
-  };
+  // Memoize context value to prevent unnecessary re-renders of all consumers
+  // when only unrelated state changes.
+  const value: ChatState = useMemo(
+    () => ({
+      messages,
+      streamingContent,
+      typing,
+      connected,
+      error,
+      sendMessage,
+    }),
+    [messages, streamingContent, typing, connected, error, sendMessage],
+  );
 
   return React.createElement(ChatContext.Provider, { value }, children);
 }

@@ -120,7 +120,13 @@ impl Memory for RedisMemory {
         let data_key = self.data_key();
 
         // Check if key already exists (upsert semantics)
-        let existing_id: Option<String> = conn.hget(&keys_key, key).await.unwrap_or(None);
+        let existing_id: Option<String> = match conn.hget(&keys_key, key).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Redis HGET keys failed during upsert check: {e}");
+                None
+            }
+        };
 
         let id = if let Some(ref eid) = existing_id {
             // Remove old vector entry before re-adding
@@ -182,6 +188,9 @@ impl Memory for RedisMemory {
 
             if let Err(e) = result {
                 tracing::warn!("Redis VADD failed (requires Redis 8+ with VectorSet support): {e}");
+                // Data is stored in hash but not searchable via recall().
+                // Return error so the caller knows the entry is only partially stored.
+                anyhow::bail!("memory entry stored but vector index failed: {e}");
             }
         }
 
@@ -226,13 +235,21 @@ impl Memory for RedisMemory {
             .arg("WITHSCORES");
 
         if let Some(sid) = session_id {
-            // VSIM FILTER uses JSONPath-style expressions on attributes
-            let filter = format!("$.session_id == \"{}\"", sid.replace('"', "\\\""));
+            // VSIM FILTER uses JSONPath-style expressions on attributes.
+            // Escape backslashes first, then double-quotes to prevent filter injection.
+            let escaped = sid.replace('\\', "\\\\").replace('"', "\\\"");
+            let filter = format!("$.session_id == \"{escaped}\"");
             cmd.arg("FILTER").arg(filter);
         }
 
         // VSIM returns alternating [element, score, element, score, ...]
-        let raw: Vec<redis::Value> = cmd.query_async(&mut conn).await.unwrap_or_default();
+        let raw: Vec<redis::Value> = match cmd.query_async(&mut conn).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Redis VSIM failed (vector search unavailable): {e}");
+                return Ok(Vec::new());
+            }
+        };
 
         let mut result_ids: Vec<(String, f64)> = Vec::new();
         let mut i = 0;
@@ -300,12 +317,29 @@ impl Memory for RedisMemory {
         let mut conn = self.conn.clone();
         let data_key = self.data_key();
 
-        // Get all entries from data hash
-        let all: std::collections::HashMap<String, String> =
-            conn.hgetall(&data_key).await.unwrap_or_default();
-
+        // Use HSCAN to iterate in batches instead of HGETALL to avoid
+        // loading the entire hash into memory at once.
         let mut entries = Vec::new();
-        for (id, json) in &all {
+        let mut cursor: u64 = 0;
+        const SCAN_COUNT: usize = 200;
+        loop {
+            let (next_cursor, batch): (u64, Vec<(String, String)>) =
+                match redis::cmd("HSCAN")
+                    .arg(&data_key)
+                    .arg(cursor)
+                    .arg("COUNT")
+                    .arg(SCAN_COUNT)
+                    .query_async(&mut conn)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("Redis HSCAN failed: {e}");
+                        break;
+                    }
+                };
+
+            for (id, json) in &batch {
             if let Ok(entry) = Self::parse_entry(id, json) {
                 // Apply filters
                 if let Some(cat) = category {
@@ -319,6 +353,12 @@ impl Memory for RedisMemory {
                     }
                 }
                 entries.push(entry);
+            }
+            }
+
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
             }
         }
 
@@ -334,23 +374,36 @@ impl Memory for RedisMemory {
         let data_key = self.data_key();
 
         // Lookup ID by key
-        let id: Option<String> = conn.hget(&keys_key, key).await.unwrap_or(None);
+        let id: Option<String> = match conn.hget(&keys_key, key).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Redis HGET failed in forget(): {e}");
+                return Ok(false);
+            }
+        };
         let Some(id) = id else {
             return Ok(false);
         };
 
-        // Remove from vectorset
-        let _: Result<(), redis::RedisError> = redis::cmd("VREM")
+        // Remove from vectorset (best-effort — may not exist if VADD failed)
+        if let Err(e) = redis::cmd("VREM")
             .arg(&vs_key)
             .arg(&id)
-            .query_async(&mut conn)
-            .await;
+            .query_async::<()>(&mut conn)
+            .await
+        {
+            tracing::warn!("Redis VREM failed in forget(): {e}");
+        }
 
         // Remove from data hash
-        let _: () = conn.hdel(&data_key, &id).await.unwrap_or(());
+        if let Err(e) = conn.hdel::<_, _, ()>(&data_key, &id).await {
+            tracing::warn!("Redis HDEL data failed in forget(): {e}");
+        }
 
         // Remove key→ID mapping
-        let _: () = conn.hdel(&keys_key, key).await.unwrap_or(());
+        if let Err(e) = conn.hdel::<_, _, ()>(&keys_key, key).await {
+            tracing::warn!("Redis HDEL keys failed in forget(): {e}");
+        }
 
         Ok(true)
     }
@@ -358,7 +411,13 @@ impl Memory for RedisMemory {
     async fn count(&self) -> Result<usize> {
         let mut conn = self.conn.clone();
         let data_key = self.data_key();
-        let count: usize = conn.hlen(&data_key).await.unwrap_or(0);
+        let count: usize = match conn.hlen(&data_key).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Redis HLEN failed in count(): {e}");
+                0
+            }
+        };
         Ok(count)
     }
 

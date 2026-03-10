@@ -100,7 +100,7 @@ pub fn hybrid_merge(
     let max_kw = if max_kw < f32::EPSILON { 1.0 } else { max_kw };
 
     for (id, score) in keyword_results {
-        let normalized = score / max_kw;
+        let normalized = (score / max_kw).max(0.0);
         map.entry(id.clone())
             .and_modify(|r| r.keyword_score = Some(normalized))
             .or_insert_with(|| ScoredResult {
@@ -369,9 +369,13 @@ mod tests {
         let kw_results = vec![("a".into(), -5.0), ("b".into(), -1.0)];
         let merged = hybrid_merge(&[], &kw_results, 0.7, 0.3, 10);
         assert_eq!(merged.len(), 2);
-        // Should still produce finite scores
+        // Negative scores must be clamped to 0.0 after normalization
         for r in &merged {
-            assert!(r.final_score.is_finite());
+            assert!(r.final_score >= 0.0, "final_score should be non-negative");
+            assert!(
+                r.keyword_score.unwrap_or(0.0) >= 0.0,
+                "keyword_score should be clamped to >= 0.0"
+            );
         }
     }
 

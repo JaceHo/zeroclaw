@@ -15,19 +15,37 @@ impl MultiObserver {
 impl Observer for MultiObserver {
     fn record_event(&self, event: &ObserverEvent) {
         for obs in &self.observers {
-            obs.record_event(event);
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.record_event(event);
+            })) {
+                tracing::error!(
+                    observer = obs.name(),
+                    "Observer panicked in record_event: {e:?}"
+                );
+            }
         }
     }
 
     fn record_metric(&self, metric: &ObserverMetric) {
         for obs in &self.observers {
-            obs.record_metric(metric);
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.record_metric(metric);
+            })) {
+                tracing::error!(
+                    observer = obs.name(),
+                    "Observer panicked in record_metric: {e:?}"
+                );
+            }
         }
     }
 
     fn flush(&self) {
         for obs in &self.observers {
-            obs.flush();
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.flush();
+            })) {
+                tracing::error!(observer = obs.name(), "Observer panicked in flush: {e:?}");
+            }
         }
     }
 

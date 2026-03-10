@@ -51,6 +51,14 @@ export class WebSocketClient {
     this.intentionallyClosed = false;
     this.clearReconnectTimer();
 
+    // Close any existing connection before opening a new one to prevent
+    // multiple concurrent WebSocket connections.
+    if (this.ws) {
+      this.ws.onclose = null; // Prevent triggering reconnect
+      this.ws.close();
+      this.ws = null;
+    }
+
     const token = getToken();
     const url = `${this.baseUrl}/ws/chat${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 

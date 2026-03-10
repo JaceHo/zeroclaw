@@ -1,7 +1,9 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
@@ -11,6 +13,7 @@ pub struct WebSearchTool {
     brave_api_key: Option<String>,
     max_results: usize,
     timeout_secs: u64,
+    security: Arc<SecurityPolicy>,
 }
 
 impl WebSearchTool {
@@ -19,12 +22,14 @@ impl WebSearchTool {
         brave_api_key: Option<String>,
         max_results: usize,
         timeout_secs: u64,
+        security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
             brave_api_key,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
+            security,
         }
     }
 
@@ -205,6 +210,22 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action budget exhausted".to_string()),
+            });
+        }
+
         let query = args
             .get("query")
             .and_then(|q| q.as_str())
@@ -236,22 +257,27 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecurityPolicy;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -265,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let result = tool
             .parse_duckduckgo_results("<html>No results here</html>", "test")
             .unwrap();
@@ -274,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -286,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -298,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0, test_security());
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -309,21 +335,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15, test_security());
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15, test_security());
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));

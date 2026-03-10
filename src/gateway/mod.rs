@@ -305,6 +305,8 @@ pub struct AppState {
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     pub wati: Option<Arc<WatiChannel>>,
+    /// WATI webhook secret for HMAC-SHA256 signature verification (`X-Hub-Signature-256`)
+    pub wati_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
@@ -528,6 +530,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wati_cfg.allowed_numbers.clone(),
             ))
         });
+    let wati_webhook_secret: Option<Arc<str>> = config
+        .channels_config
+        .wati
+        .as_ref()
+        .and_then(|cfg| cfg.webhook_secret.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(Arc::from);
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
@@ -676,6 +685,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
+        wati_webhook_secret,
         observer: broadcast_observer,
         tools_registry,
         cost_tracker,
@@ -1388,13 +1398,40 @@ pub struct WatiVerifyQuery {
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
-async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+async fn handle_wati_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
     let Some(ref wati) = state.wati else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "WATI not configured"})),
         );
     };
+
+    // ── Security: Verify X-Hub-Signature-256 if webhook_secret is configured ──
+    if let Some(ref webhook_secret) = state.wati_webhook_secret {
+        let signature = headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !verify_whatsapp_signature(webhook_secret, &body, signature) {
+            tracing::warn!(
+                "WATI webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
 
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -1635,6 +1672,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1688,6 +1726,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2058,6 +2097,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2126,6 +2166,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2206,6 +2247,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2258,6 +2300,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2315,6 +2358,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2377,6 +2421,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -2435,6 +2480,7 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,
+            wati_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,

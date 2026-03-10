@@ -30,11 +30,19 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    // Only parse codes that appear near HTTP-status context words to avoid
+    // false positives from arbitrary numbers in model names, timestamps, etc.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>() {
-            if (400..500).contains(&code) {
-                return code != 429 && code != 408;
+    let lower = msg.to_lowercase();
+    for pattern in ["status: ", "status code: ", "http ", "responded with "] {
+        if let Some(pos) = lower.find(pattern) {
+            let after = &msg[pos + pattern.len()..];
+            if let Some(code_str) = after.split(|c: char| !c.is_ascii_digit()).next() {
+                if let Ok(code) = code_str.parse::<u16>() {
+                    if (400..500).contains(&code) {
+                        return code != 429 && code != 408;
+                    }
+                }
             }
         }
     }
@@ -94,9 +102,16 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
             return status.as_u16() == 429;
         }
     }
+    // Only treat "429" as a status code when it appears alongside HTTP-status
+    // context words, to avoid matching arbitrary numbers in model names, etc.
     let msg = err.to_string();
-    msg.contains("429")
-        && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
+    let lower = msg.to_lowercase();
+    let has_status_context = lower.contains("status")
+        || lower.contains("http")
+        || lower.contains("response")
+        || lower.contains("too many")
+        || lower.contains("rate");
+    msg.contains("429") && has_status_context
 }
 
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
@@ -134,10 +149,16 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     }
 
     // Known provider business codes observed for 429 where retry is futile.
-    for token in lower.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = token.parse::<u16>() {
-            if matches!(code, 1113 | 1311) {
-                return true;
+    // Only parse codes when the message contains a JSON-like "code" field
+    // to avoid matching arbitrary numbers in timestamps, IDs, etc.
+    let has_code_context =
+        lower.contains("\"code\"") || lower.contains("code:") || lower.contains("error_code");
+    if has_code_context {
+        for token in lower.split(|c: char| !c.is_ascii_digit()) {
+            if let Ok(code) = token.parse::<u16>() {
+                if matches!(code, 1113 | 1311) {
+                    return true;
+                }
             }
         }
     }
@@ -1046,10 +1067,10 @@ mod tests {
 
     #[test]
     fn non_retryable_detects_common_patterns() {
-        assert!(is_non_retryable(&anyhow::anyhow!("400 Bad Request")));
+        assert!(is_non_retryable(&anyhow::anyhow!("HTTP 400 Bad Request")));
         assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
         assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
-        assert!(is_non_retryable(&anyhow::anyhow!("404 Not Found")));
+        assert!(is_non_retryable(&anyhow::anyhow!("HTTP 404 Not Found")));
         assert!(is_non_retryable(&anyhow::anyhow!(
             "invalid api key provided"
         )));
@@ -1555,6 +1576,19 @@ mod tests {
             !is_rate_limited(&err),
             "generic errors must not be flagged as rate-limited"
         );
+    }
+
+    #[test]
+    fn non_retryable_ignores_bare_numbers_without_http_context() {
+        // A bare "400" without status/HTTP context should not be treated as non-retryable
+        assert!(
+            !is_non_retryable(&anyhow::anyhow!("400 Bad Request")),
+            "bare 400 without HTTP context should not match"
+        );
+        // But "status: 400" or "HTTP 400" should still match
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "responded with 400 Bad Request"
+        )));
     }
 
     // ── §2.3 Malformed API response error classification ─────

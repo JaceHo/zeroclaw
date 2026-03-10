@@ -6,6 +6,15 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Provider name
     fn name(&self) -> &str;
 
+    /// Model identifier (e.g. "text-embedding-3-small").
+    ///
+    /// Used in cache keys to invalidate stale embeddings when the model
+    /// changes.  The default returns the provider name, which is correct
+    /// only for single-model providers like `NoopEmbedding`.
+    fn model_id(&self) -> &str {
+        self.name()
+    }
+
     /// Embedding dimensions
     fn dimensions(&self) -> usize;
 
@@ -97,6 +106,10 @@ impl OpenAiEmbedding {
 impl EmbeddingProvider for OpenAiEmbedding {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
     }
 
     fn dimensions(&self) -> usize {

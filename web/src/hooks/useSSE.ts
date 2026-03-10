@@ -59,15 +59,20 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
     return clientRef.current;
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Track mounted state to prevent state updates after unmount
+  const mountedRef = useRef(true);
+
   // Setup handlers and optionally connect on mount
   useEffect(() => {
+    mountedRef.current = true;
     const client = getClient();
 
     client.onConnect = () => {
-      setStatus('connected');
+      if (mountedRef.current) setStatus('connected');
     };
 
     client.onEvent = (event: SSEEvent) => {
+      if (!mountedRef.current) return;
       // Apply type filter if configured
       if (filterRef.current && filterRef.current.length > 0) {
         if (!filterRef.current.includes(event.type)) return;
@@ -84,7 +89,7 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
     };
 
     client.onError = () => {
-      setStatus('disconnected');
+      if (mountedRef.current) setStatus('disconnected');
     };
 
     if (autoConnect) {
@@ -93,6 +98,7 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
     }
 
     return () => {
+      mountedRef.current = false;
       client.disconnect();
       clientRef.current = null;
     };

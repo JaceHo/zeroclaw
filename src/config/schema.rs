@@ -3113,6 +3113,10 @@ pub struct WatiConfig {
     /// Allowed phone numbers (E.164 format) or "*" for all.
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Webhook secret for HMAC-SHA256 signature verification (X-Hub-Signature-256).
+    /// When set, incoming webhook requests must include a valid signature.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 }
 
 fn default_wati_api_url() -> String {
@@ -4307,6 +4311,22 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        // Agent limits
+        if self.agent.max_tool_iterations == 0 {
+            anyhow::bail!("agent.max_tool_iterations must be greater than 0");
+        }
+        if self.agent.max_history_messages == 0 {
+            anyhow::bail!("agent.max_history_messages must be greater than 0");
+        }
+
+        // Temperature range
+        if !(0.0..=2.0).contains(&self.default_temperature) {
+            anyhow::bail!(
+                "default_temperature must be between 0.0 and 2.0 (got {})",
+                self.default_temperature
+            );
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");

@@ -294,6 +294,7 @@ pub fn all_tools_with_runtime(
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
+            security.clone(),
         )));
     }
 

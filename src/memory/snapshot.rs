@@ -123,20 +123,40 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
             category   TEXT NOT NULL DEFAULT 'core',
             embedding  BLOB,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            session_id TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
         CREATE INDEX IF NOT EXISTS idx_mem_cat ON memories(category);
         CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
             USING fts5(key, content, content='memories', content_rowid='rowid');
 
+        -- FTS5 triggers: keep in sync with memories table
+        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, key, content)
+            VALUES (new.rowid, new.key, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, key, content)
+            VALUES ('delete', old.rowid, old.key, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, key, content)
+            VALUES ('delete', old.rowid, old.key, old.content);
+            INSERT INTO memories_fts(rowid, key, content)
+            VALUES (new.rowid, new.key, new.content);
+        END;
+
         CREATE TABLE IF NOT EXISTS embedding_cache (
             content_hash TEXT PRIMARY KEY,
             embedding    BLOB NOT NULL,
-            created_at   TEXT NOT NULL
-        );",
+            created_at   TEXT NOT NULL,
+            accessed_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
     )?;
 
     let now = Local::now().to_rfc3339();
@@ -152,11 +172,7 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
 
         match result {
             Ok(changed) if changed > 0 => {
-                // Populate FTS5
-                let _ = conn.execute(
-                    "INSERT INTO memories_fts(key, content) VALUES (?1, ?2)",
-                    params![key, content],
-                );
+                // FTS5 is populated automatically by the memories_ai trigger
                 hydrated += 1;
             }
             Ok(_) => {

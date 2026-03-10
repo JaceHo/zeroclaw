@@ -227,7 +227,8 @@ impl SqliteMemory {
             return Ok(None); // Noop embedder
         }
 
-        let hash = Self::content_hash(text);
+        // Include embedder model in cache key to invalidate on model change
+        let hash = format!("{}:{}", self.embedder.model_id(), Self::content_hash(text));
         let now = Local::now().to_rfc3339();
 
         // Check cache (offloaded to blocking thread)

@@ -169,6 +169,20 @@ impl Tool for ImageInfoTool {
             });
         }
 
+        // Resolve symlinks and re-check to prevent workspace escape via symlinks
+        if path.exists() {
+            if let Ok(canonical) = tokio::fs::canonicalize(path).await {
+                let canonical_str = canonical.to_string_lossy();
+                if !self.security.is_path_allowed(&canonical_str) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Access denied: resolved path is outside workspace")),
+                    });
+                }
+            }
+        }
+
         if !path.exists() {
             return Ok(ToolResult {
                 success: false,

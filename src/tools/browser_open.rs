@@ -340,6 +340,39 @@ fn is_private_or_local_host(host: &str) -> bool {
             || (a == 100 && (64..=127).contains(&b));
     }
 
+    // IPv6 private/local range checks.
+    // Strip brackets in case of `[::1]` form (extract_host currently rejects
+    // bracket-wrapped IPv6, but defend in depth).
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(addr) = bare.parse::<std::net::Ipv6Addr>() {
+        let segments = addr.segments();
+        // Loopback ::1
+        if addr.is_loopback() {
+            return true;
+        }
+        // Link-local fe80::/10
+        if segments[0] & 0xffc0 == 0xfe80 {
+            return true;
+        }
+        // Unique local fc00::/7
+        if segments[0] & 0xfe00 == 0xfc00 {
+            return true;
+        }
+        // IPv4-mapped ::ffff:x.x.x.x — check the embedded IPv4 address
+        if segments[0..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+            #[allow(clippy::cast_possible_truncation)]
+            let ipv4 = std::net::Ipv4Addr::new(
+                (segments[6] >> 8) as u8,
+                (segments[6] & 0xff) as u8,
+                (segments[7] >> 8) as u8,
+                (segments[7] & 0xff) as u8,
+            );
+            if ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local() {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -486,6 +519,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
+    }
+
+    #[test]
+    fn is_private_rejects_ipv6_loopback() {
+        assert!(is_private_or_local_host("::1"));
+    }
+
+    #[test]
+    fn is_private_rejects_ipv6_unique_local() {
+        assert!(is_private_or_local_host("fd12:3456:789a::1"));
+    }
+
+    #[test]
+    fn is_private_rejects_ipv6_link_local() {
+        assert!(is_private_or_local_host("fe80::1"));
+    }
+
+    #[test]
+    fn is_private_rejects_ipv4_mapped_loopback() {
+        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
+    }
+
+    #[test]
+    fn is_private_rejects_ipv4_mapped_private() {
+        assert!(is_private_or_local_host("::ffff:192.168.1.1"));
     }
 
     #[test]

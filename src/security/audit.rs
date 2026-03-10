@@ -166,6 +166,17 @@ impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         let log_path = zeroclaw_dir.join(&config.log_path);
+        // Validate that the resolved log path stays within zeroclaw_dir
+        // to prevent path traversal via config.log_path (e.g. "../../etc/passwd").
+        let canonical_dir = std::fs::canonicalize(&zeroclaw_dir).unwrap_or(zeroclaw_dir.clone());
+        if let Ok(canonical_log) = std::fs::canonicalize(log_path.parent().unwrap_or(&log_path)) {
+            if !canonical_log.starts_with(&canonical_dir) {
+                anyhow::bail!(
+                    "audit log_path escapes zeroclaw directory: {}",
+                    config.log_path
+                );
+            }
+        }
         Ok(Self {
             log_path,
             config,

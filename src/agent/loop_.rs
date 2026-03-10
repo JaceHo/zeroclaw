@@ -169,6 +169,17 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let to_remove = trimmable - max_history;
     history.drain(pinned..pinned + to_remove);
+
+    // Prevent orphaned tool-result messages: if the first message after the
+    // pinned prefix is a tool-result without a preceding assistant (tool-call),
+    // it violates the API contract. Remove orphans greedily.
+    while history.len() > pinned {
+        if history[pinned].role == "tool" {
+            history.remove(pinned);
+        } else {
+            break;
+        }
+    }
 }
 
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
@@ -853,7 +864,7 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Regex to find <parameter name="paramname">value</parameter>
     static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#).unwrap()
+        Regex::new(r#"(?s)<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>"#).unwrap()
     });
 
     for cap in INVOKE_RE.captures_iter(response) {
@@ -1051,7 +1062,7 @@ fn build_curl_command(url: &str) -> Option<String> {
         return None;
     }
 
-    let escaped = url.replace('\'', r#"'\\''"#);
+    let escaped = url.replace('\'', r#"'\''"#);
     Some(format!("curl -s '{}'", escaped))
 }
 
@@ -2376,15 +2387,36 @@ pub(crate) async fn run_tool_call_loop(
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_BYTES bytes for progressive draft updates.
+                // For CJK and other scripts without whitespace, fall back to
+                // splitting at char boundaries to avoid buffering the entire text
+                // as a single chunk.
                 let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
+                let mut broken = false;
+                for segment in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
                         .as_ref()
                         .is_some_and(CancellationToken::is_cancelled)
                     {
                         return Err(ToolLoopCancelled.into());
                     }
-                    chunk.push_str(word);
+                    // If the segment itself exceeds the chunk threshold (e.g.
+                    // CJK text with no whitespace), split it at char boundaries.
+                    if segment.len() >= STREAM_CHUNK_MIN_BYTES {
+                        for ch in segment.chars() {
+                            chunk.push(ch);
+                            if chunk.len() >= STREAM_CHUNK_MIN_BYTES
+                                && tx.send(std::mem::take(&mut chunk)).await.is_err()
+                            {
+                                broken = true;
+                                break;
+                            }
+                        }
+                        if broken {
+                            break; // receiver dropped
+                        }
+                    } else {
+                        chunk.push_str(segment);
+                    }
                     if chunk.len() >= STREAM_CHUNK_MIN_BYTES
                         && tx.send(std::mem::take(&mut chunk)).await.is_err()
                     {
@@ -2538,6 +2570,26 @@ pub(crate) async fn run_tool_call_loop(
                         output: duplicate.clone(),
                         success: false,
                         error_reason: Some(duplicate),
+                        duration: Duration::ZERO,
+                    },
+                ));
+                continue;
+            }
+
+            // ── Excluded tools enforcement at execution layer ──
+            // The LLM may still reference excluded tools via text-parsed
+            // calls that bypass the native tool spec filtering above.
+            if excluded_tools.iter().any(|ex| ex == &tool_name) {
+                let blocked = format!(
+                    "Tool '{tool_name}' is excluded from this channel and cannot be executed."
+                );
+                ordered_results[idx] = Some((
+                    tool_name.clone(),
+                    call.tool_call_id.clone(),
+                    ToolExecutionOutcome {
+                        output: blocked.clone(),
+                        success: false,
+                        error_reason: Some(blocked),
                         duration: Duration::ZERO,
                     },
                 ));
@@ -3246,6 +3298,9 @@ pub struct AgentSessionContext {
     pub(crate) min_relevance_score: f64,
     pub(crate) compact_context: bool,
     pub(crate) auto_save: bool,
+    pub(crate) channel_name: String,
+    pub(crate) hooks: Option<std::sync::Arc<crate::hooks::HookRunner>>,
+    pub(crate) non_cli_excluded_tools: Vec<String>,
 }
 
 impl AgentSessionContext {
@@ -3419,6 +3474,17 @@ impl AgentSessionContext {
             min_relevance_score: config.memory.min_relevance_score,
             compact_context: config.agent.compact_context,
             auto_save: config.memory.auto_save,
+            channel_name: "websocket".to_string(),
+            hooks: if config.hooks.enabled {
+                let mut runner = crate::hooks::HookRunner::new();
+                if config.hooks.builtin.command_logger {
+                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                }
+                Some(std::sync::Arc::new(runner))
+            } else {
+                None
+            },
+            non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
         })
     }
 
@@ -3440,6 +3506,11 @@ impl AgentSessionContext {
                 .store(&user_key, message, MemoryCategory::Conversation, None)
                 .await;
         }
+    }
+
+    /// Override the channel name used for tracing and observability.
+    pub fn set_channel_name(&mut self, name: impl Into<String>) {
+        self.channel_name = name.into();
     }
 
     /// Process a single user turn within an ongoing session.
@@ -3492,13 +3563,17 @@ impl AgentSessionContext {
             self.temperature,
             true,
             None,
-            "ws",
+            &self.channel_name,
             &self.multimodal_config,
             self.max_tool_iterations,
             None,
             on_delta,
-            None,
-            &[],
+            self.hooks.as_deref(),
+            if self.channel_name == "cli" {
+                &[]
+            } else {
+                &self.non_cli_excluded_tools
+            },
         )
         .await
         {

@@ -14,7 +14,7 @@
 
 use super::event_bus::EventBus;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -48,14 +48,14 @@ pub struct RedisEventBus {
 /// Fixed-capacity ring buffer of event IDs for deduplication.
 struct DedupRing {
     ids: HashSet<String>,
-    order: Vec<String>,
+    order: VecDeque<String>,
 }
 
 impl DedupRing {
     fn new() -> Self {
         Self {
             ids: HashSet::with_capacity(MAX_DEDUP_IDS),
-            order: Vec::with_capacity(MAX_DEDUP_IDS),
+            order: VecDeque::with_capacity(MAX_DEDUP_IDS),
         }
     }
 
@@ -65,11 +65,12 @@ impl DedupRing {
             return false;
         }
         if self.order.len() >= MAX_DEDUP_IDS {
-            // Evict oldest
-            let evicted = self.order.remove(0);
-            self.ids.remove(&evicted);
+            // Evict oldest — O(1) with VecDeque vs O(N) with Vec
+            if let Some(evicted) = self.order.pop_front() {
+                self.ids.remove(&evicted);
+            }
         }
-        self.order.push(id);
+        self.order.push_back(id);
         true
     }
 

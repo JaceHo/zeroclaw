@@ -222,6 +222,14 @@ impl Memory for PostgresMemory {
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
+
+            // Escape ILIKE wildcards in the search term to prevent
+            // unintended pattern matching from user-supplied `%`, `_`, or `\`.
+            let escaped_query = query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id,
@@ -240,7 +248,7 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
+            let rows = client.query(&stmt, &[&escaped_query, &sid, &limit_i64])?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()

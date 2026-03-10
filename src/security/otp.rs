@@ -91,7 +91,7 @@ impl OtpValidator {
         let is_valid = counters
             .iter()
             .map(|c| compute_totp_code(&self.secret, *c))
-            .any(|candidate| candidate == normalized);
+            .any(|candidate| super::pairing::constant_time_eq(&candidate, normalized));
 
         if is_valid {
             let mut cache = self.cached_codes.lock();

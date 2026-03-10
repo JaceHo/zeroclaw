@@ -63,11 +63,24 @@ pub async fn handle_sse_events(
             serde_json::Value,
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
+            use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
             match result {
-                Ok(value) => Some(Ok::<_, Infallible>(
-                    Event::default().data(value.to_string()),
-                )),
-                Err(_) => None, // Skip lagged messages
+                Ok(mut value) => {
+                    // Strip internal dedup ID before delivering to clients
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.remove("_zcid");
+                    }
+                    Some(Ok::<_, Infallible>(
+                        Event::default().data(value.to_string()),
+                    ))
+                }
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    let lagged = serde_json::json!({
+                        "type": "lagged",
+                        "missed": n,
+                    });
+                    Some(Ok(Event::default().data(lagged.to_string())))
+                }
             }
         },
     );

@@ -49,6 +49,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const streamingRef = useRef('');
 
   const wsRef = useRef<WebSocketClient | null>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Safety net: reset typing state if no response within 2 minutes
+  const resetTypingTimeout = useCallback(() => {
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      setTyping(false);
+      setStreamingContent('');
+      streamingRef.current = '';
+    }, 120_000);
+  }, []);
+
+  const clearTypingTimeout = useCallback(() => {
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -81,9 +99,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           setTyping(true);
           streamingRef.current += msg.content ?? '';
           setStreamingContent(streamingRef.current);
+          resetTypingTimeout();
           break;
 
         case 'done': {
+          clearTypingTimeout();
           // Use ref to read current streaming content (avoids nested setState).
           const content = msg.full_response ?? msg.content ?? streamingRef.current;
           if (content) {
@@ -107,6 +127,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         // extensions. The server currently only sends chunk/done/error.
 
         case 'error':
+          clearTypingTimeout();
           setMessages((prev) => [
             ...prev,
             {
@@ -127,9 +148,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     wsRef.current = ws;
 
     return () => {
+      clearTypingTimeout();
       ws.disconnect();
     };
-  }, []);
+  }, [resetTypingTimeout, clearTypingTimeout]);
 
   const sendMessage = useCallback((content: string) => {
     const trimmed = content.trim();
@@ -150,6 +172,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setTyping(true);
       setStreamingContent('');
       streamingRef.current = '';
+      resetTypingTimeout();
     } catch {
       setError('Failed to send message. Please try again.');
     }

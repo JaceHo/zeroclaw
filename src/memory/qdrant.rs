@@ -212,6 +212,7 @@ struct QdrantScrollResult {
 #[derive(Debug, Deserialize)]
 struct QdrantScrollPoints {
     points: Vec<QdrantPoint>,
+    next_page_offset: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,16 +450,100 @@ impl Memory for QdrantMemory {
             }));
         }
 
-        let mut scroll_body = serde_json::json!({
-            "limit": 1000,
-            "with_payload": true
-        });
+        let filter = if must_conditions.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "must": must_conditions }))
+        };
 
-        if !must_conditions.is_empty() {
-            scroll_body["filter"] = serde_json::json!({ "must": must_conditions });
+        let mut all_entries = Vec::new();
+        let mut offset: Option<serde_json::Value> = None;
+
+        loop {
+            let mut scroll_body = serde_json::json!({
+                "limit": 100,
+                "with_payload": true
+            });
+
+            if let Some(ref f) = filter {
+                scroll_body["filter"] = f.clone();
+            }
+
+            if let Some(ref off) = offset {
+                scroll_body["offset"] = off.clone();
+            }
+
+            let resp = self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/collections/{}/points/scroll", self.collection),
+                )
+                .json(&scroll_body)
+                .send()
+                .await
+                .context("failed to scroll Qdrant")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+            }
+
+            let result: QdrantScrollResult = resp.json().await?;
+
+            let batch: Vec<MemoryEntry> = result
+                .result
+                .points
+                .into_iter()
+                .filter_map(|point| {
+                    let payload = point.payload?;
+                    let id = match &point.id {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => return None,
+                    };
+
+                    Some(MemoryEntry {
+                        id,
+                        key: payload.key,
+                        content: payload.content,
+                        category: Self::parse_category(&payload.category),
+                        timestamp: payload.timestamp,
+                        session_id: payload.session_id,
+                        score: None,
+                    })
+                })
+                .collect();
+
+            all_entries.extend(batch);
+
+            match result.result.next_page_offset {
+                Some(next_offset) => {
+                    offset = Some(next_offset);
+                }
+                None => break,
+            }
         }
 
-        let resp = self
+        Ok(all_entries)
+    }
+
+    async fn forget(&self, key: &str) -> Result<bool> {
+        self.ensure_initialized().await?;
+
+        // First, check if a point with this key exists
+        let scroll_body = serde_json::json!({
+            "filter": {
+                "must": [{
+                    "key": "key",
+                    "match": { "value": key }
+                }]
+            },
+            "limit": 1,
+            "with_payload": false
+        });
+
+        let scroll_resp = self
             .request(
                 reqwest::Method::POST,
                 &format!("/collections/{}/points/scroll", self.collection),
@@ -466,45 +551,18 @@ impl Memory for QdrantMemory {
             .json(&scroll_body)
             .send()
             .await
-            .context("failed to scroll Qdrant")?;
+            .context("failed to scroll Qdrant for forget lookup")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+        if !scroll_resp.status().is_success() {
+            let status = scroll_resp.status();
+            let text = scroll_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant scroll failed during forget ({status}): {text}");
         }
 
-        let result: QdrantScrollResult = resp.json().await?;
-
-        let entries = result
-            .result
-            .points
-            .into_iter()
-            .filter_map(|point| {
-                let payload = point.payload?;
-                let id = match &point.id {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => return None,
-                };
-
-                Some(MemoryEntry {
-                    id,
-                    key: payload.key,
-                    content: payload.content,
-                    category: Self::parse_category(&payload.category),
-                    timestamp: payload.timestamp,
-                    session_id: payload.session_id,
-                    score: None,
-                })
-            })
-            .collect();
-
-        Ok(entries)
-    }
-
-    async fn forget(&self, key: &str) -> Result<bool> {
-        self.ensure_initialized().await?;
+        let scroll_result: QdrantScrollResult = scroll_resp.json().await?;
+        if scroll_result.result.points.is_empty() {
+            return Ok(false);
+        }
 
         // Delete points matching the key
         let delete_body = serde_json::json!({
@@ -533,7 +591,6 @@ impl Memory for QdrantMemory {
             anyhow::bail!("Qdrant delete failed ({status}): {text}");
         }
 
-        // Qdrant doesn't return deleted count easily, assume success
         Ok(true)
     }
 

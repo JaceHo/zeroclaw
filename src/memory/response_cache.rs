@@ -12,6 +12,20 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// Backend-agnostic response cache interface.
+///
+/// Implementations may use SQLite (default) or Redis (opt-in).
+pub trait ResponseCacheBackend: Send + Sync {
+    /// Look up a cached response by key. Returns `None` on miss or expired entry.
+    fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Store a response in the cache.
+    fn put(&self, key: &str, model: &str, response: &str, token_count: u32) -> Result<()>;
+    /// Return cache statistics: (total_entries, total_hits, total_tokens_saved).
+    fn stats(&self) -> Result<(usize, u64, u64)>;
+    /// Wipe the entire cache. Returns the number of entries cleared.
+    fn clear(&self) -> Result<usize>;
+}
+
 /// Response cache backed by a dedicated SQLite database.
 ///
 /// Lives alongside `brain.db` as `response_cache.db` so it can be
@@ -167,6 +181,24 @@ impl ResponseCache {
 
         let affected = conn.execute("DELETE FROM response_cache", [])?;
         Ok(affected)
+    }
+}
+
+impl ResponseCacheBackend for ResponseCache {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        ResponseCache::get(self, key)
+    }
+
+    fn put(&self, key: &str, model: &str, response: &str, token_count: u32) -> Result<()> {
+        ResponseCache::put(self, key, model, response, token_count)
+    }
+
+    fn stats(&self) -> Result<(usize, u64, u64)> {
+        ResponseCache::stats(self)
+    }
+
+    fn clear(&self) -> Result<usize> {
+        ResponseCache::clear(self)
     }
 }
 
@@ -419,5 +451,23 @@ mod tests {
 
         let (_, hits, _) = cache.stats().unwrap();
         assert_eq!(hits, 10, "all concurrent reads should register as hits");
+    }
+
+    #[test]
+    fn response_cache_backend_trait_impl() {
+        let (_tmp, cache) = temp_cache(60);
+        let backend: &dyn ResponseCacheBackend = &cache;
+
+        let key = ResponseCache::cache_key("gpt-4", None, "trait test");
+        backend.put(&key, "gpt-4", "trait response", 15).unwrap();
+
+        let result = backend.get(&key).unwrap();
+        assert_eq!(result.as_deref(), Some("trait response"));
+
+        let (count, _, _) = backend.stats().unwrap();
+        assert_eq!(count, 1);
+
+        let cleared = backend.clear().unwrap();
+        assert_eq!(cleared, 1);
     }
 }

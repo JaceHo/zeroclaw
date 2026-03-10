@@ -9,6 +9,10 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+#[cfg(feature = "redis")]
+pub mod redis_cache;
+#[cfg(feature = "redis")]
+pub mod redis_mem;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -26,7 +30,7 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
-pub use response_cache::ResponseCache;
+pub use response_cache::{ResponseCache, ResponseCacheBackend};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -377,29 +381,67 @@ pub fn create_memory_for_migration(
 }
 
 /// Factory: create an optional response cache from config.
-pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
-    if !config.response_cache_enabled {
+///
+/// Returns a `Box<dyn ResponseCacheBackend>` — either the default SQLite-backed
+/// `ResponseCache` or, when compiled with `--features redis` and Redis is
+/// configured, a `RedisResponseCache`.
+pub fn create_response_cache(
+    config: &crate::Config,
+    workspace_dir: &Path,
+) -> Option<Box<dyn ResponseCacheBackend>> {
+    if !config.memory.response_cache_enabled {
         return None;
+    }
+
+    #[cfg(feature = "redis")]
+    if config.redis.enabled && config.redis.response_cache {
+        match create_redis_response_cache(config) {
+            Ok(cache) => {
+                tracing::info!(
+                    "💾 Response cache enabled (Redis, TTL: {}min)",
+                    config.memory.response_cache_ttl_minutes,
+                );
+                return Some(Box::new(cache));
+            }
+            Err(e) => {
+                tracing::warn!("Redis response cache failed, falling back to SQLite: {e}");
+            }
+        }
     }
 
     match ResponseCache::new(
         workspace_dir,
-        config.response_cache_ttl_minutes,
-        config.response_cache_max_entries,
+        config.memory.response_cache_ttl_minutes,
+        config.memory.response_cache_max_entries,
     ) {
         Ok(cache) => {
             tracing::info!(
-                "💾 Response cache enabled (TTL: {}min, max: {} entries)",
-                config.response_cache_ttl_minutes,
-                config.response_cache_max_entries
+                "💾 Response cache enabled (SQLite, TTL: {}min, max: {} entries)",
+                config.memory.response_cache_ttl_minutes,
+                config.memory.response_cache_max_entries
             );
-            Some(cache)
+            Some(Box::new(cache))
         }
         Err(e) => {
             tracing::warn!("Response cache disabled due to error: {e}");
             None
         }
     }
+}
+
+#[cfg(feature = "redis")]
+fn create_redis_response_cache(
+    config: &crate::Config,
+) -> anyhow::Result<redis_cache::RedisResponseCache> {
+    let conn = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(crate::redis_conn::create_connection_manager(&config.redis))
+    })?;
+    Ok(redis_cache::RedisResponseCache::new(
+        conn,
+        &config.redis.key_prefix,
+        config.memory.response_cache_ttl_minutes,
+    ))
 }
 
 #[cfg(test)]
@@ -465,7 +507,7 @@ mod tests {
     fn factory_unknown_falls_back_to_markdown() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
-            backend: "redis".into(),
+            backend: "unknown-backend".into(),
             ..MemoryConfig::default()
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();

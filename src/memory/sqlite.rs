@@ -76,8 +76,8 @@ impl SqliteMemory {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
+             PRAGMA mmap_size    = 67108864;
+             PRAGMA cache_size   = -8000;
              PRAGMA temp_store   = MEMORY;",
         )?;
 

@@ -4,6 +4,7 @@ pub enum MemoryBackendKind {
     Lucid,
     Postgres,
     Qdrant,
+    Redis,
     Markdown,
     None,
     Unknown,
@@ -83,6 +84,15 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const REDIS_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "redis",
+    label: "Redis with HNSW Vector Search — requires Redis 8+ with VectorSet support",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
 const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] = [
     SQLITE_PROFILE,
     LUCID_PROFILE,
@@ -104,6 +114,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "redis" => MemoryBackendKind::Redis,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -116,6 +127,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::Redis => REDIS_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
@@ -142,8 +154,16 @@ mod tests {
     }
 
     #[test]
+    fn classify_redis_backend() {
+        assert_eq!(classify_memory_backend("redis"), MemoryBackendKind::Redis);
+    }
+
+    #[test]
     fn classify_unknown_backend() {
-        assert_eq!(classify_memory_backend("redis"), MemoryBackendKind::Unknown);
+        assert_eq!(
+            classify_memory_backend("unknown-backend"),
+            MemoryBackendKind::Unknown
+        );
     }
 
     #[test]

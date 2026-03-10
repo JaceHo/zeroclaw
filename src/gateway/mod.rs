@@ -434,12 +434,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 );
                 Arc::new(bus)
             } else {
-                Arc::new(event_bus::TokioBroadcastBus::new(config.gateway.event_bus_capacity))
+                Arc::new(event_bus::TokioBroadcastBus::new(
+                    config.gateway.event_bus_capacity,
+                ))
             }
         }
         #[cfg(not(feature = "redis"))]
         {
-            Arc::new(event_bus::TokioBroadcastBus::new(config.gateway.event_bus_capacity))
+            Arc::new(event_bus::TokioBroadcastBus::new(
+                config.gateway.event_bus_capacity,
+            ))
         }
     };
     // Extract webhook secret for authentication

@@ -48,8 +48,8 @@ fn config_default_temperature_positive() {
 fn agent_config_default_max_tool_iterations() {
     let agent = AgentConfig::default();
     assert_eq!(
-        agent.max_tool_iterations, 10,
-        "default max_tool_iterations should be 10"
+        agent.max_tool_iterations, 25,
+        "default max_tool_iterations should be 25"
     );
 }
 
@@ -57,8 +57,8 @@ fn agent_config_default_max_tool_iterations() {
 fn agent_config_default_max_history_messages() {
     let agent = AgentConfig::default();
     assert_eq!(
-        agent.max_history_messages, 50,
-        "default max_history_messages should be 50"
+        agent.max_history_messages, 100,
+        "default max_history_messages should be 100"
     );
 }
 
@@ -202,8 +202,8 @@ default_temperature = 0.7
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
-    assert_eq!(parsed.agent.max_history_messages, 50);
+    assert_eq!(parsed.agent.max_tool_iterations, 25);
+    assert_eq!(parsed.agent.max_history_messages, 100);
     assert!(!parsed.agent.compact_context);
 }
 
@@ -222,7 +222,7 @@ compact_context = true
     assert_eq!(parsed.agent.max_tool_iterations, 3);
     assert!(parsed.agent.compact_context);
     // max_history_messages should still use default
-    assert_eq!(parsed.agent.max_history_messages, 50);
+    assert_eq!(parsed.agent.max_history_messages, 100);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

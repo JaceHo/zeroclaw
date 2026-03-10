@@ -158,8 +158,7 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let first_user_idx = history.iter().position(|m| m.role == "user");
     let pinned = match (has_system, first_user_idx) {
         (true, Some(idx)) if idx > 0 => idx + 1, // system + first user
-        (true, _) => 1,                          // system only
-        (false, Some(0)) => 1,                   // first user (no system)
+        (true, _) | (false, Some(0)) => 1,       // system only OR first user (no system)
         _ => 0,
     };
 
@@ -213,9 +212,17 @@ async fn auto_compact_history(
         return Ok(false);
     }
 
-    let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
+    // Pin the system prompt and first user message — mirror trim_history pinning
+    // so compaction never replaces the original user request with a summary.
+    let first_user_idx = history.iter().position(|m| m.role == "user");
+    let start = match (has_system, first_user_idx) {
+        (true, Some(idx)) if idx > 0 => idx + 1,
+        (true, _) | (false, Some(0)) => 1,
+        _ => 0,
+    };
+    let compactable_count = history.len().saturating_sub(start);
+    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(compactable_count);
+    let compact_count = compactable_count.saturating_sub(keep_recent);
     if compact_count == 0 {
         return Ok(false);
     }
@@ -3469,9 +3476,8 @@ impl AgentSessionContext {
             format!("{context}[{now}] {message}")
         };
 
-        history.push(ChatMessage::user(&enriched));
-
         let history_len_before = history.len();
+        history.push(ChatMessage::user(&enriched));
         let response = match run_tool_call_loop(
             self.provider.as_ref(),
             history,
@@ -3494,9 +3500,9 @@ impl AgentSessionContext {
         {
             Ok(r) => r,
             Err(e) => {
-                // Roll back the user message we pushed so subsequent turns don't
-                // see a dangling user entry with no assistant response.
-                history.truncate(history_len_before.saturating_sub(1));
+                // Roll back to pre-turn state: remove the user message AND any
+                // intermediate assistant/tool messages appended during the loop.
+                history.truncate(history_len_before);
                 return Err(e);
             }
         };
@@ -3510,7 +3516,7 @@ impl AgentSessionContext {
         )
         .await
         {
-            tracing::debug!("Auto-compaction skipped: {e}");
+            tracing::warn!("Auto-compaction skipped: {e}");
         }
 
         // Hard cap as a safety net.

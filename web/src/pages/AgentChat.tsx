@@ -1,4 +1,4 @@
-import { useState, useLayoutEffect, useRef } from 'react';
+import { useState, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import { useChat } from '@/hooks/useChat';
 
@@ -37,7 +37,7 @@ export default function AgentChat() {
     inputRef.current?.focus();
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();

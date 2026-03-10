@@ -331,7 +331,9 @@ impl Memory for RedisMemory {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(anyhow::anyhow!("Redis HSCAN failed at cursor {cursor}: {e}"));
+                    return Err(anyhow::anyhow!(
+                        "Redis HSCAN failed at cursor {cursor}: {e}"
+                    ));
                 }
             };
 
@@ -381,6 +383,10 @@ impl Memory for RedisMemory {
             return Ok(false);
         };
 
+        // Track partial failures — returning Ok(true) when deletions are
+        // incomplete would hide orphaned data (vectors, hash entries).
+        let mut all_ok = true;
+
         // Remove from vectorset (best-effort — may not exist if VADD failed)
         if let Err(e) = redis::cmd("VREM")
             .arg(&vs_key)
@@ -389,19 +395,22 @@ impl Memory for RedisMemory {
             .await
         {
             tracing::warn!("Redis VREM failed in forget(): {e}");
+            all_ok = false;
         }
 
         // Remove from data hash
         if let Err(e) = conn.hdel::<_, _, ()>(&data_key, &id).await {
             tracing::warn!("Redis HDEL data failed in forget(): {e}");
+            all_ok = false;
         }
 
         // Remove key→ID mapping
         if let Err(e) = conn.hdel::<_, _, ()>(&keys_key, key).await {
             tracing::warn!("Redis HDEL keys failed in forget(): {e}");
+            all_ok = false;
         }
 
-        Ok(true)
+        Ok(all_ok)
     }
 
     async fn count(&self) -> Result<usize> {

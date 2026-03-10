@@ -8,7 +8,6 @@ import {
   useMemo,
   type ReactNode,
 } from 'react';
-import React from 'react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 
@@ -170,7 +169,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [messages, streamingContent, typing, connected, error, sendMessage],
   );
 
-  return React.createElement(ChatContext.Provider, { value }, children);
+  return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 }
 
 // ---------------------------------------------------------------------------

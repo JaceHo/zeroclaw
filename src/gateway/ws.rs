@@ -53,10 +53,10 @@ pub async fn handle_ws_chat(
     // pass the check before any of them increment the counter).
     let max = state.max_ws_connections;
     if max > 0 {
-        let prev = state.ws_connections.fetch_add(1, Ordering::Relaxed);
+        let prev = state.ws_connections.fetch_add(1, Ordering::AcqRel);
         if prev >= max {
             // Over limit — roll back the speculative increment.
-            state.ws_connections.fetch_sub(1, Ordering::Relaxed);
+            state.ws_connections.fetch_sub(1, Ordering::Release);
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Too many WebSocket connections",
@@ -70,7 +70,10 @@ pub async fn handle_ws_chat(
             .into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Unlimited — still track for observability so /metrics can report active WS count.
+    let guard = WsConnectionGuard(Arc::clone(&state.ws_connections));
+    state.ws_connections.fetch_add(1, Ordering::AcqRel);
+    ws.on_upgrade(move |socket| handle_socket_with_guard(socket, state, guard))
         .into_response()
 }
 
@@ -147,6 +150,7 @@ async fn handle_socket_inner(
         }
 
         let provider_label = &ctx.provider_name;
+        let turn_start = std::time::Instant::now();
 
         // Broadcast agent_start event via observer (adds timestamp + metrics)
         state
@@ -211,7 +215,7 @@ async fn handle_socket_inner(
                     .record_event(&crate::observability::ObserverEvent::AgentEnd {
                         provider: provider_label.to_string(),
                         model: state.model.clone(),
-                        duration: std::time::Duration::ZERO,
+                        duration: turn_start.elapsed(),
                         tokens_used: None,
                         cost_usd: None,
                     });
@@ -247,6 +251,6 @@ struct WsConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for WsConnectionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }

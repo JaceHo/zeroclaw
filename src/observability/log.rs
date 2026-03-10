@@ -48,7 +48,7 @@ impl Observer for LogObserver {
                 info!("heartbeat.tick");
             }
             ObserverEvent::Error { component, message } => {
-                info!(component = %component, error = %message, "error");
+                tracing::warn!(component = %component, error = %message, "error");
             }
             ObserverEvent::LlmRequest {
                 provider,

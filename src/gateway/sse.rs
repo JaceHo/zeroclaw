@@ -46,15 +46,15 @@ pub async fn handle_sse_events(
     let max = state.max_sse_connections;
     let counter = Arc::clone(&state.sse_connections);
     if max > 0 {
-        let prev = state.sse_connections.fetch_add(1, Ordering::Relaxed);
+        let prev = state.sse_connections.fetch_add(1, Ordering::AcqRel);
         if prev >= max {
             // Over limit — roll back the speculative increment.
-            state.sse_connections.fetch_sub(1, Ordering::Relaxed);
+            state.sse_connections.fetch_sub(1, Ordering::Release);
             return (StatusCode::SERVICE_UNAVAILABLE, "Too many SSE connections").into_response();
         }
     } else {
         // Unlimited — still track for observability.
-        state.sse_connections.fetch_add(1, Ordering::Relaxed);
+        state.sse_connections.fetch_add(1, Ordering::AcqRel);
     }
 
     let rx = state.event_tx.subscribe();
@@ -109,7 +109,7 @@ struct SseConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for SseConnectionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 

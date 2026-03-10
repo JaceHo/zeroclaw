@@ -34,3 +34,6 @@ credentials.json
 
 # Coverage artifacts
 lcov.info
+
+# Task tracking (local only)
+todo.txt

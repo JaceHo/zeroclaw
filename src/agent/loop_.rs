@@ -63,8 +63,13 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 chars for context, then redact.
+            // Use char_indices to avoid panicking on multi-byte UTF-8.
+            let prefix = val
+                .char_indices()
+                .nth(4)
+                .map(|(i, _)| &val[..i])
+                .unwrap_or("");
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -3477,7 +3482,8 @@ impl AgentSessionContext {
 
         history.push(ChatMessage::user(&enriched));
 
-        let response = run_tool_call_loop(
+        let history_len_before = history.len();
+        let response = match run_tool_call_loop(
             self.provider.as_ref(),
             history,
             &self.tools_registry,
@@ -3495,16 +3501,28 @@ impl AgentSessionContext {
             None,
             &[],
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back the user message we pushed so subsequent turns don't
+                // see a dangling user entry with no assistant response.
+                history.truncate(history_len_before.saturating_sub(1));
+                return Err(e);
+            }
+        };
 
         // Auto-compaction before hard trimming to preserve long-context signal.
-        let _ = auto_compact_history(
+        if let Err(e) = auto_compact_history(
             history,
             self.provider.as_ref(),
             &self.model_name,
             self.max_history_messages,
         )
-        .await;
+        .await
+        {
+            tracing::debug!("Auto-compaction skipped: {e}");
+        }
 
         // Hard cap as a safety net.
         trim_history(history, self.max_history_messages);

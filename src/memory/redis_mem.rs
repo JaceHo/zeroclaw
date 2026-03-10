@@ -23,7 +23,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::Utc;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -112,7 +112,7 @@ impl Memory for RedisMemory {
         session_id: Option<&str>,
     ) -> Result<()> {
         let mut conn = self.conn.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let cat = Self::category_to_str(&category).to_string();
 
         let keys_key = self.keys_key();
@@ -120,32 +120,49 @@ impl Memory for RedisMemory {
         let data_key = self.data_key();
 
         // Check if key already exists (upsert semantics)
-        let existing_id: Option<String> = match conn.hget(&keys_key, key).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Redis HGET keys failed during upsert check: {e}");
-                None
-            }
-        };
+        let existing_id: Option<String> = conn
+            .hget(&keys_key, key)
+            .await
+            .context("Redis HGET keys failed during upsert check")?;
 
-        let id = if let Some(ref eid) = existing_id {
-            // Remove old vector entry before re-adding
-            let _: Result<(), redis::RedisError> = redis::cmd("VREM")
-                .arg(&vs_key)
-                .arg(eid.as_str())
-                .query_async(&mut conn)
-                .await;
-            eid.clone()
-        } else {
-            Uuid::new_v4().to_string()
-        };
+        let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Compute embedding
+        // Compute embedding before writing any state — fail fast to avoid
+        // orphaned hash entries when the embedding provider is down.
         let embedding = if self.embedder.dimensions() > 0 {
-            self.embedder.embed_one(content).await.ok()
+            Some(
+                self.embedder
+                    .embed_one(content)
+                    .await
+                    .context("embedding failed for memory store")?,
+            )
         } else {
             None
         };
+
+        // Add to vectorset first (if we have an embedding). VADD natively
+        // upserts: if the element ID already exists, the vector and attributes
+        // are replaced — no need for explicit VREM.
+        if let Some(emb) = &embedding {
+            let bytes = vector::vec_to_bytes(emb);
+            let attrs = serde_json::json!({
+                "key": key,
+                "category": cat,
+                "session_id": session_id,
+                "timestamp": now,
+            });
+
+            redis::cmd("VADD")
+                .arg(&vs_key)
+                .arg("FP32")
+                .arg(bytes.as_slice())
+                .arg(&id)
+                .arg("SETATTR")
+                .arg(attrs.to_string())
+                .query_async::<()>(&mut conn)
+                .await
+                .context("Redis VADD failed (requires Redis 8+ with VectorSet support)")?;
+        }
 
         // Store full entry as JSON in data hash
         let entry_json = serde_json::json!({
@@ -165,34 +182,6 @@ impl Memory for RedisMemory {
             .hset(&keys_key, key, &id)
             .await
             .context("Redis HSET keys failed")?;
-
-        // Add to vectorset (if we have an embedding)
-        if let Some(emb) = embedding {
-            let bytes = vector::vec_to_bytes(&emb);
-            let attrs = serde_json::json!({
-                "key": key,
-                "category": cat,
-                "session_id": session_id.unwrap_or(""),
-                "timestamp": now,
-            });
-
-            let result: Result<(), redis::RedisError> = redis::cmd("VADD")
-                .arg(&vs_key)
-                .arg("FP32")
-                .arg(bytes.as_slice())
-                .arg(&id)
-                .arg("SETATTR")
-                .arg(attrs.to_string())
-                .query_async(&mut conn)
-                .await;
-
-            if let Err(e) = result {
-                tracing::warn!("Redis VADD failed (requires Redis 8+ with VectorSet support): {e}");
-                // Data is stored in hash but not searchable via recall().
-                // Return error so the caller knows the entry is only partially stored.
-                anyhow::bail!("memory entry stored but vector index failed: {e}");
-            }
-        }
 
         Ok(())
     }
@@ -235,10 +224,10 @@ impl Memory for RedisMemory {
             .arg("WITHSCORES");
 
         if let Some(sid) = session_id {
-            // VSIM FILTER uses JSONPath-style expressions on attributes.
+            // VSIM FILTER uses dot-notation for top-level attribute fields.
             // Escape backslashes first, then double-quotes to prevent filter injection.
             let escaped = sid.replace('\\', "\\\\").replace('"', "\\\"");
-            let filter = format!("$.session_id == \"{escaped}\"");
+            let filter = format!(".session_id == \"{escaped}\"");
             cmd.arg("FILTER").arg(filter);
         }
 
@@ -275,10 +264,19 @@ impl Memory for RedisMemory {
             i += 2;
         }
 
-        // Fetch full entries for the result IDs
+        // Fetch full entries in a single HMGET round-trip
+        if result_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<&str> = result_ids.iter().map(|(id, _)| id.as_str()).collect();
+        let jsons: Vec<Option<String>> = conn
+            .hget(&data_key, &ids)
+            .await
+            .unwrap_or_else(|_| vec![None; ids.len()]);
+
         let mut entries = Vec::with_capacity(result_ids.len());
-        for (id, score) in &result_ids {
-            let json: Option<String> = conn.hget(&data_key, id).await.unwrap_or(None);
+        for ((id, score), json) in result_ids.iter().zip(jsons) {
             if let Some(json) = json {
                 if let Ok(mut entry) = Self::parse_entry(id, &json) {
                     entry.score = Some(*score);
@@ -323,37 +321,35 @@ impl Memory for RedisMemory {
         let mut cursor: u64 = 0;
         const SCAN_COUNT: usize = 200;
         loop {
-            let (next_cursor, batch): (u64, Vec<(String, String)>) =
-                match redis::cmd("HSCAN")
-                    .arg(&data_key)
-                    .arg(cursor)
-                    .arg("COUNT")
-                    .arg(SCAN_COUNT)
-                    .query_async(&mut conn)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Redis HSCAN failed: {e}");
-                        break;
-                    }
-                };
+            let (next_cursor, batch): (u64, Vec<(String, String)>) = match redis::cmd("HSCAN")
+                .arg(&data_key)
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query_async(&mut conn)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Redis HSCAN failed at cursor {cursor}: {e}"));
+                }
+            };
 
             for (id, json) in &batch {
-            if let Ok(entry) = Self::parse_entry(id, json) {
-                // Apply filters
-                if let Some(cat) = category {
-                    if &entry.category != cat {
-                        continue;
+                if let Ok(entry) = Self::parse_entry(id, json) {
+                    // Apply filters
+                    if let Some(cat) = category {
+                        if &entry.category != cat {
+                            continue;
+                        }
                     }
-                }
-                if let Some(sid) = session_id {
-                    if entry.session_id.as_deref() != Some(sid) {
-                        continue;
+                    if let Some(sid) = session_id {
+                        if entry.session_id.as_deref() != Some(sid) {
+                            continue;
+                        }
                     }
+                    entries.push(entry);
                 }
-                entries.push(entry);
-            }
             }
 
             cursor = next_cursor;

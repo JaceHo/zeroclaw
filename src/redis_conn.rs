@@ -27,9 +27,8 @@ pub async fn create_connection_manager(
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "Redis connection timed out after {}s — is Redis running at {}?",
+                "Redis connection timed out after {}s — is Redis running at the configured URL?",
                 CONNECT_TIMEOUT.as_secs(),
-                config.url
             )
         })?
         .context("failed to connect to Redis")?;

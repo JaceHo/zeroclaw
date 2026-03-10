@@ -59,6 +59,11 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
+        MemoryBackendKind::Redis => {
+            anyhow::bail!(
+                "memory backend 'redis' must be created via create_memory_from_config(); use the full Config path"
+            );
+        }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
@@ -378,6 +383,76 @@ pub fn create_memory_for_migration(
         || anyhow::bail!("postgres backend is not available in migration context"),
         " during migration",
     )
+}
+
+/// Factory: create memory from the full application config.
+///
+/// Handles all backend types including Redis (which requires both `[redis]` and
+/// `[memory]` config sections). Delegates to `create_memory_with_storage_and_routes`
+/// for non-Redis backends.
+pub fn create_memory_from_config(config: &crate::Config) -> anyhow::Result<Box<dyn Memory>> {
+    let backend_name =
+        effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+
+    #[cfg(feature = "redis")]
+    if classify_memory_backend(&backend_name) == MemoryBackendKind::Redis {
+        return create_redis_memory(config);
+    }
+
+    #[cfg(not(feature = "redis"))]
+    if classify_memory_backend(&backend_name) == MemoryBackendKind::Redis {
+        anyhow::bail!(
+            "memory backend 'redis' requested but this build was compiled without `redis`; rebuild with `--features redis`"
+        );
+    }
+
+    create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )
+}
+
+#[cfg(feature = "redis")]
+fn create_redis_memory(config: &crate::Config) -> anyhow::Result<Box<dyn Memory>> {
+    if !config.redis.enabled {
+        anyhow::bail!(
+            "memory backend 'redis' requires [redis].enabled = true in config"
+        );
+    }
+
+    let resolved_embedding = resolve_embedding_config(
+        &config.memory,
+        &config.embedding_routes,
+        config.api_key.as_deref(),
+    );
+
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+        Arc::from(embeddings::create_embedding_provider(
+            &resolved_embedding.provider,
+            resolved_embedding.api_key.as_deref(),
+            &resolved_embedding.model,
+            resolved_embedding.dimensions,
+        ));
+
+    let conn = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(crate::redis_conn::create_connection_manager(&config.redis))
+    })?;
+
+    tracing::info!(
+        "🧠 Redis memory backend configured (url: {}, prefix: {}mem:)",
+        config.redis.url,
+        config.redis.key_prefix,
+    );
+
+    Ok(Box::new(redis_mem::RedisMemory::new(
+        conn,
+        &config.redis.key_prefix,
+        embedder,
+    )))
 }
 
 /// Factory: create an optional response cache from config.

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useLayoutEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import { useChat } from '@/hooks/useChat';
 
@@ -17,8 +17,10 @@ export default function AgentChat() {
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Auto-scroll only when user is near the bottom (not reading history)
-  useEffect(() => {
+  // Auto-scroll only when user is near the bottom (not reading history).
+  // useLayoutEffect runs after DOM mutations but before paint, giving accurate
+  // scroll measurements (useEffect would read stale scrollTop).
+  useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     const isNearBottom =

@@ -84,7 +84,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           setStreamingContent(streamingRef.current);
           break;
 
-        case 'message':
         case 'done': {
           // Use ref to read current streaming content (avoids nested setState).
           const content = msg.full_response ?? msg.content ?? streamingRef.current;

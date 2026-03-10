@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
-const STREAM_CHUNK_MIN_CHARS: usize = 40;
+/// Minimum bytes per chunk when relaying LLM text to a streaming draft.
+/// Compared against `str::len()` (byte count), not character count.
+const STREAM_CHUNK_MIN_BYTES: usize = 40;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -2363,7 +2364,7 @@ pub(crate) async fn run_tool_call_loop(
                 // Clear accumulated progress lines before streaming the final answer.
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
-                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                // STREAM_CHUNK_MIN_BYTES bytes for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
@@ -2373,7 +2374,7 @@ pub(crate) async fn run_tool_call_loop(
                         return Err(ToolLoopCancelled.into());
                     }
                     chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
+                    if chunk.len() >= STREAM_CHUNK_MIN_BYTES
                         && tx.send(std::mem::take(&mut chunk)).await.is_err()
                     {
                         break; // receiver dropped
@@ -2751,12 +2752,7 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_from_config(&config)?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
     // ── Peripherals (merge peripheral tools into registry) ─
@@ -3259,12 +3255,7 @@ impl AgentSessionContext {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-            &config.memory,
-            Some(&config.storage.provider.config),
-            &config.workspace_dir,
-            config.api_key.as_deref(),
-        )?);
+        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_from_config(config)?);
 
         let (composio_key, composio_entity_id) = if config.composio.enabled {
             (

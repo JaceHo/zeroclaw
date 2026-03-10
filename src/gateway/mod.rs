@@ -313,6 +313,14 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// Event bus for real-time SSE/WS event delivery (in-process or Redis-backed).
     pub event_tx: Arc<dyn event_bus::EventBus>,
+    /// Active WebSocket connection counter for enforcing max_ws_connections.
+    pub ws_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Maximum concurrent WebSocket connections (0 = unlimited).
+    pub max_ws_connections: usize,
+    /// Active SSE connection counter for enforcing max_sse_connections.
+    pub sse_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Maximum concurrent SSE connections (0 = unlimited).
+    pub max_sse_connections: usize,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -417,7 +425,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     conn,
                     &config.redis.url,
                     config.redis.event_channel.clone(),
-                    1024,
+                    config.gateway.event_bus_capacity,
                 )
                 .await?;
                 tracing::info!(
@@ -426,12 +434,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 );
                 Arc::new(bus)
             } else {
-                Arc::new(event_bus::TokioBroadcastBus::new(1024))
+                Arc::new(event_bus::TokioBroadcastBus::new(config.gateway.event_bus_capacity))
             }
         }
         #[cfg(not(feature = "redis"))]
         {
-            Arc::new(event_bus::TokioBroadcastBus::new(1024))
+            Arc::new(event_bus::TokioBroadcastBus::new(config.gateway.event_bus_capacity))
         }
     };
     // Extract webhook secret for authentication
@@ -668,6 +676,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_ws_connections: config.gateway.max_ws_connections,
+        sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_sse_connections: config.gateway.max_sse_connections,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1623,6 +1635,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1672,6 +1688,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2038,6 +2058,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2102,6 +2126,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let headers = HeaderMap::new();
@@ -2178,6 +2206,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let response = handle_webhook(
@@ -2226,6 +2258,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2279,6 +2315,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2337,6 +2377,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2391,6 +2435,10 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: Arc::new(event_bus::TokioBroadcastBus::new(16)),
+            ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_ws_connections: 0,
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_connections: 0,
         };
 
         let mut headers = HeaderMap::new();

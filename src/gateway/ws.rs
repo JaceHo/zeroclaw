@@ -21,6 +21,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -47,11 +48,47 @@ pub async fn handle_ws_chat(
         }
     }
 
+    // Enforce max WS connection limit using atomic fetch_add + rollback to avoid
+    // TOCTOU races (a plain load-then-check would allow concurrent upgrades to all
+    // pass the check before any of them increment the counter).
+    let max = state.max_ws_connections;
+    if max > 0 {
+        let prev = state.ws_connections.fetch_add(1, Ordering::Relaxed);
+        if prev >= max {
+            // Over limit — roll back the speculative increment.
+            state.ws_connections.fetch_sub(1, Ordering::Relaxed);
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Too many WebSocket connections",
+            )
+                .into_response();
+        }
+        // Slot reserved — pass the guard to handle_socket so it decrements on drop.
+        let guard = WsConnectionGuard(Arc::clone(&state.ws_connections));
+        return ws
+            .on_upgrade(move |socket| handle_socket_with_guard(socket, state, guard))
+            .into_response();
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
         .into_response()
 }
 
+/// Handle socket when connection limit is unlimited (no guard needed from caller).
 async fn handle_socket(socket: WebSocket, state: AppState) {
+    handle_socket_inner(socket, state, None).await;
+}
+
+/// Handle socket when the connection slot was already reserved by the caller.
+async fn handle_socket_with_guard(socket: WebSocket, state: AppState, guard: WsConnectionGuard) {
+    handle_socket_inner(socket, state, Some(guard)).await;
+}
+
+async fn handle_socket_inner(
+    socket: WebSocket,
+    state: AppState,
+    _guard: Option<WsConnectionGuard>,
+) {
     let (ws_sender, mut receiver) = socket.split();
     let ws_sender = Arc::new(Mutex::new(ws_sender));
 
@@ -113,12 +150,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let provider_label = &ctx.provider_name;
 
         // Broadcast agent_start event via observer (adds timestamp + metrics)
-        state.observer.record_event(
-            &crate::observability::ObserverEvent::AgentStart {
+        state
+            .observer
+            .record_event(&crate::observability::ObserverEvent::AgentStart {
                 provider: provider_label.to_string(),
                 model: state.model.clone(),
-            },
-        );
+            });
 
         // Auto-save to memory (gateway webhook handlers do their own;
         // the WS handler uses the generic key like the CLI REPL).
@@ -170,15 +207,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .send(Message::Text(done.to_string().into()))
                     .await;
 
-                state.observer.record_event(
-                    &crate::observability::ObserverEvent::AgentEnd {
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::AgentEnd {
                         provider: provider_label.to_string(),
                         model: state.model.clone(),
                         duration: std::time::Duration::ZERO,
                         tokens_used: None,
                         cost_usd: None,
-                    },
-                );
+                    });
             }
             Err(e) => {
                 // Abort relay on error
@@ -195,13 +232,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .send(Message::Text(err.to_string().into()))
                     .await;
 
-                state.observer.record_event(
-                    &crate::observability::ObserverEvent::Error {
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::Error {
                         component: "ws_chat".to_string(),
                         message: sanitized.to_string(),
-                    },
-                );
+                    });
             }
         }
+    }
+}
+
+/// RAII guard that decrements the WS connection counter when dropped.
+struct WsConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }

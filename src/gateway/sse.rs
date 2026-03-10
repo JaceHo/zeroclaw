@@ -12,6 +12,8 @@ use axum::{
     },
 };
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -38,6 +40,23 @@ pub async fn handle_sse_events(
         }
     }
 
+    // Enforce max SSE connection limit using atomic fetch_add + rollback to avoid
+    // TOCTOU races (a plain load-then-check would allow concurrent requests to all
+    // pass the check before any of them increment the counter).
+    let max = state.max_sse_connections;
+    let counter = Arc::clone(&state.sse_connections);
+    if max > 0 {
+        let prev = state.sse_connections.fetch_add(1, Ordering::Relaxed);
+        if prev >= max {
+            // Over limit — roll back the speculative increment.
+            state.sse_connections.fetch_sub(1, Ordering::Relaxed);
+            return (StatusCode::SERVICE_UNAVAILABLE, "Too many SSE connections").into_response();
+        }
+    } else {
+        // Unlimited — still track for observability.
+        state.sse_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
         |result: Result<
@@ -53,13 +72,45 @@ pub async fn handle_sse_events(
         },
     );
 
-    Sse::new(stream)
+    // Wrap stream to decrement counter when the client disconnects.
+    let counted_stream = SseConnectionStream {
+        inner: stream,
+        _guard: SseConnectionGuard(counter),
+    };
+
+    Sse::new(counted_stream)
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))
                 .text("ping"),
         )
         .into_response()
+}
+
+/// Wrapper stream that holds an RAII guard for SSE connection counting.
+struct SseConnectionStream<S> {
+    inner: S,
+    _guard: SseConnectionGuard,
+}
+
+impl<S: futures_util::Stream + Unpin> futures_util::Stream for SseConnectionStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// RAII guard that decrements the SSE connection counter when dropped.
+struct SseConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Broadcast observer that forwards events to the SSE event bus.

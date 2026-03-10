@@ -804,6 +804,18 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Maximum concurrent WebSocket connections (0 = unlimited). Default: `64`.
+    #[serde(default = "default_max_ws_connections")]
+    pub max_ws_connections: usize,
+
+    /// Maximum concurrent SSE connections (0 = unlimited). Default: `128`.
+    #[serde(default = "default_max_sse_connections")]
+    pub max_sse_connections: usize,
+
+    /// Capacity of the SSE event broadcast channel. Default: `1024`.
+    #[serde(default = "default_event_bus_capacity")]
+    pub event_bus_capacity: usize,
 }
 
 fn default_gateway_port() -> u16 {
@@ -834,6 +846,18 @@ fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
+fn default_max_ws_connections() -> usize {
+    64
+}
+
+fn default_max_sse_connections() -> usize {
+    128
+}
+
+fn default_event_bus_capacity() -> usize {
+    1024
+}
+
 fn default_true() -> bool {
     true
 }
@@ -852,6 +876,9 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            max_ws_connections: default_max_ws_connections(),
+            max_sse_connections: default_max_sse_connections(),
+            event_bus_capacity: default_event_bus_capacity(),
         }
     }
 }
@@ -1488,10 +1515,12 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 
 /// Validate a Redis URL is parseable and uses a recognized scheme.
 fn redis_url_valid(url: &str) -> Result<()> {
-    let parsed =
-        reqwest::Url::parse(url).with_context(|| format!("'{url}' is not a valid URL"))?;
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("'{url}' is not a valid URL"))?;
     if !matches!(parsed.scheme(), "redis" | "rediss" | "redis+unix") {
-        anyhow::bail!("scheme '{}' not recognized; expected redis:// or rediss://", parsed.scheme());
+        anyhow::bail!(
+            "scheme '{}' not recognized; expected redis:// or rediss://",
+            parsed.scheme()
+        );
     }
     Ok(())
 }
@@ -4350,6 +4379,11 @@ impl Config {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
 
+        // Gateway connection/capacity limits
+        if self.gateway.event_bus_capacity == 0 {
+            anyhow::bail!("gateway.event_bus_capacity must be greater than 0");
+        }
+
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
             anyhow::bail!("scheduler.max_concurrent must be greater than 0");
@@ -4464,10 +4498,13 @@ impl Config {
                 anyhow::bail!("redis.key_prefix must not be empty when redis.enabled = true");
             }
             if self.redis.event_bus && self.redis.event_channel.trim().is_empty() {
-                anyhow::bail!(
-                    "redis.event_channel must not be empty when redis.event_bus = true"
-                );
+                anyhow::bail!("redis.event_channel must not be empty when redis.event_bus = true");
             }
+        }
+
+        // Cross-section: memory.backend = "redis" requires [redis].enabled
+        if self.memory.backend == "redis" && !self.redis.enabled {
+            anyhow::bail!("memory.backend = \"redis\" requires [redis].enabled = true");
         }
 
         // Proxy (delegate to existing validation)
@@ -6133,6 +6170,9 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            max_ws_connections: 64,
+            max_sse_connections: 128,
+            event_bus_capacity: 1024,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
